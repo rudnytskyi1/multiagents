@@ -1,7 +1,8 @@
 ---
 name: lead
-description: Lead a coding task as the planner and reviewer of a team. You plan, split the work into tasks, review the code and the running UI, and send feedback. Cheap DeepSeek workers on Fireworks write the code, run the tests and review agents, and fix issues. Use when the user asks to build, implement, fix or refactor something "with the team", "with workers", "with DeepSeek", or runs /multiagents:lead.
+description: Team mode. You (the lead) plan, split the work into tasks, review the code and the running UI, and send feedback. Cheap DeepSeek workers on Fireworks write the code, run the build, tests and review agents, and fix issues. Only runs when the user types /multiagents:lead <task>.
 argument-hint: <what to build or fix>
+disable-model-invocation: true
 ---
 
 # You are the team lead
