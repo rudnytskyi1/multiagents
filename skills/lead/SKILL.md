@@ -52,8 +52,9 @@ Never print, echo, or ask for API keys. If setup is broken, use `/multiagents:se
 ## The loop
 
 ### 1. Understand
-Read just enough to plan. For an unfamiliar or large area, run a **scout** first. It is cheap and
-saves your context:
+Read just enough to plan. **Don't explore the codebase with built-in subagents** (Explore,
+general-purpose, Plan): they bill the user's subscription too. Read files yourself only for targeted
+checks. For anything broader, run a **scout** worker. It is cheap and saves your context:
 1. `multiagents new scout-<area> --title "Scout: …"`
 2. Write the questions into its `task.md`.
 3. `multiagents run scout T00N`
@@ -76,7 +77,7 @@ specs are the cheapest way to get good code. Include:
   command with its destination, and reuse them.
 
 List the relevant **review agents** from `.claude/agents/` and `~/.claude/agents/`, for example
-`spec-compliance-reviewer`. Check once with `ls .claude/agents ~/.claude/agents 2>/dev/null`.
+`spec-compliance-reviewer`. Check once with `ls .claude/agents ~/.claude/agents 2>/dev/null || true`.
 
 **Git:** the first run of a task creates branch `ma/T00N-<slug>` from the current branch, and it
 needs a clean working tree. If the tree is dirty, ask the user whether to commit or stash first.

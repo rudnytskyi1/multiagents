@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 ROOT = Path(__file__).resolve().parent.parent
 PROMPTS = ROOT / "worker" / "prompts"
 TEMPLATES = ROOT / "worker" / "templates"
