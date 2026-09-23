@@ -221,7 +221,8 @@ edge case baked into the spec itself.
   deliberate: it keeps specs honest.
 - Start tasks from a named branch (detached HEAD is refused so accept/reject know where to
   merge).
-- macOS and Linux; Windows is untested. `shot --ios` needs macOS + Xcode tools.
+- macOS, Linux, and Windows (via Claude Code's Git Bash; no Developer Mode needed — symlinks
+  fall back to junctions/copies). `shot --ios` needs macOS + Xcode tools.
 - Claude Code reports costs at Anthropic prices for unknown models; multiagents ignores that and
   uses your `prices` config.
 

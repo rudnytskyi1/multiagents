@@ -77,6 +77,29 @@ task's `shots/` folder (any PNG there is handed to the fixer).
 **Image is 500px wide with margins (Linux)** — no `sips`/ImageMagick found for the crop;
 install `imagemagick` or ignore the margins.
 
+## Windows
+
+**`WinError 1314` (a required privilege is not held) during setup/self-test**
+Fixed in v0.2.1: creating symlinks on Windows needs Developer Mode, so the worker config dir
+now falls back to directory junctions and then to auto-refreshed copies. Update the plugin
+(`claude plugin update multiagents@multiagents`); enabling Developer Mode (Settings → System →
+For developers) also makes real symlinks work, but is not required.
+
+**`python3` not found**
+Windows installs Python as `python` / the `py` launcher; there is no `python3` shim. v0.2.1's
+launchers try `python3`, then `python`, then `py -3` (and reject the Microsoft Store stub).
+If none exist, install Python 3.9+ from python.org and re-run.
+
+**Storing the key (no macOS Keychain)**
+Save it to `%USERPROFILE%\.multiagents\fireworks.key` (or `deepseek.key`) as a single line, or
+set a user environment variable `FIREWORKS_API_KEY` / `DEEPSEEK_API_KEY`. The CLI stages env
+keys into a file itself, so workers never see the variable.
+
+**General Windows notes**
+Claude Code on Windows runs shell commands through Git Bash — install Git for Windows if
+`doctor` complains about the shell. Worker stop/timeout uses `taskkill` under the hood.
+`shot --ios` is macOS-only; `shot --url` works with Chrome or Edge installed.
+
 ## Reading the artifacts
 
 - `NN-<role>.log` — timeline: every tool call, `[error]` tool failures, `[stderr]` from the

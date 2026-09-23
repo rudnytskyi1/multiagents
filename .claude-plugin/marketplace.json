@@ -11,7 +11,7 @@
       "name": "multiagents",
       "source": "./",
       "description": "Your Claude session leads (plans, reviews code and UI); DeepSeek workers on Fireworks write, test, and fix the code.",
-      "version": "0.2.0"
+      "version": "0.2.1"
     }
   ]
 }

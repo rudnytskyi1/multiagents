@@ -1,6 +1,6 @@
 {
   "name": "multiagents",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Your session leads: it plans, reviews code, and checks the UI. Cheap DeepSeek workers (Fireworks or api.deepseek.com) write, test, and fix the code, with your review agents in the loop.",
   "author": {
     "name": "rudnytskyi1"

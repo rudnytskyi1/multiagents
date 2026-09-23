@@ -37,7 +37,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 ROOT = Path(__file__).resolve().parent.parent
 PROMPTS = ROOT / "worker" / "prompts"
 TEMPLATES = ROOT / "worker" / "templates"
@@ -168,7 +168,32 @@ def _secret_denies() -> list:
 SCOUT_DENY = ["Bash(git add *)", "Bash(git commit *)", "Bash(git rm *)", "Bash(git mv *)",
               "Bash(git restore *)", "Bash(mkdir *)", "Bash(touch *)"]
 
-# Variables kept even though they match the stripped prefixes.
+IS_WINDOWS = sys.platform == "win32"
+# Spawn children in their own group so we can stop the whole tree.
+POPEN_GROUP_KW = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WINDOWS
+                  else {"start_new_session": True})
+
+
+def kill_tree(proc: "subprocess.Popen", hard: bool = False) -> None:
+    """Terminate a worker and everything it spawned, on both platforms."""
+    try:
+        if IS_WINDOWS:
+            args = ["taskkill", "/T", "/PID", str(proc.pid)]
+            if hard:
+                args.insert(1, "/F")
+            subprocess.run(args, capture_output=True)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL if hard else signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        pass
+
+
+def sh_path(p) -> str:
+    """A path for a shell command line that also works in Git Bash on Windows."""
+    return shlex.quote(str(p).replace("\\", "/"))
+
+# Variables kept even though they match the stripped prefixes. On Windows, Claude Code needs
+# CLAUDE_CODE_GIT_BASH_PATH to find the shell its Bash tool (and apiKeyHelper) run in.
 KEEP_ENV = {"CLAUDE_CODE_GIT_BASH_PATH"}
 STRIP_PREFIXES = ("ANTHROPIC_", "CLAUDE")
 NOISE = re.compile(r"^\[claude-code:unrecognized_model\]|no stdin data received")
@@ -347,7 +372,7 @@ def key_source(cfg: dict) -> tuple[str | None, str | None]:
         fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(env_val)
-        return f"env {env_name} (staged to {staged})", f"cat {shlex.quote(str(staged))}"
+        return f"env {env_name} (staged to {staged})", f"cat {sh_path(staged)}"
     service = cfg["keychain_service"]
     if sys.platform == "darwin" and shutil.which("security"):
         r = subprocess.run(["security", "find-generic-password", "-s", service], capture_output=True)
@@ -355,7 +380,7 @@ def key_source(cfg: dict) -> tuple[str | None, str | None]:
             return f'macOS Keychain "{service}"', f"security find-generic-password -s {shlex.quote(service)} -w"
     key_file = Path(cfg["key_file"]).expanduser()
     if key_file.is_file():
-        return f"file {key_file}", f"cat {shlex.quote(str(key_file))}"
+        return f"file {key_file}", f"cat {sh_path(key_file)}"
     return None, None
 
 
@@ -368,25 +393,59 @@ def read_key(helper: str) -> str:
 
 
 def no_key_help(cfg: dict) -> str:
+    env_name = cfg.get("key_env") or "the key env var"
+    if IS_WINDOWS:
+        return (f"no API key found for provider \"{cfg.get('provider_name')}\". Store it (do not paste it "
+                f"into chat): save it to the file {cfg['key_file']} (create the folder if needed), or set "
+                f"the {env_name} environment variable for your user.")
     return (f"no API key found for provider \"{cfg.get('provider_name')}\". Store it (do not paste it into chat), "
             f"e.g. on macOS:\n  security add-generic-password -s {cfg['keychain_service']} -a \"$USER\" -w\n"
-            f"(the command asks for the key), or export {cfg.get('key_env') or 'the key env var'}, "
+            f"(the command asks for the key), or export {env_name}, "
             f"or put it in {cfg['key_file']} (chmod 600).")
 
 
 # ----------------------------------------------------------------------------- worker isolation
 
+def _mirror(src: Path, dst: Path) -> None:
+    """Make dst reflect src: symlink where possible, else (Windows without Developer Mode,
+    WinError 1314) a directory junction, else a copy refreshed when the source is newer."""
+    if dst.is_symlink():
+        return
+    try:
+        dst.symlink_to(src, target_is_directory=src.is_dir())
+        return
+    except OSError:
+        pass
+    if IS_WINDOWS and src.is_dir() and not dst.exists():
+        # Junctions need no privilege; mklink is a cmd builtin.
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(dst), str(src)], capture_output=True)
+        if r.returncode == 0:
+            return
+    # Last resort: copy, refreshed whenever the source tree is newer than the last copy.
+    stamp = dst.parent / (dst.name + ".copied-at")
+    src_mtime = max([src.stat().st_mtime] + [p.stat().st_mtime for p in src.rglob("*")]) \
+        if src.is_dir() else src.stat().st_mtime
+    if dst.exists() and stamp.exists() and float(stamp.read_text() or 0) >= src_mtime:
+        return
+    if src.is_dir():
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+    else:
+        shutil.copy2(src, dst)
+    stamp.write_text(str(src_mtime))
+
+
 def worker_home(cfg: dict) -> Path:
     """Separate CLAUDE_CONFIG_DIR for workers: no stored login, no user MCP servers or plugins,
-    but the user's own agents, skills and CLAUDE.md are linked in so workers can use them."""
+    but the user's own agents, skills and CLAUDE.md are linked (or, on Windows without symlink
+    rights, junctioned/copied) in so workers can use them."""
     home = Path(cfg.get("worker_home") or STATE_HOME / "worker-home").expanduser()
     home.mkdir(parents=True, exist_ok=True)
     user_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
     if user_dir.resolve() != home.resolve():
         for name in ("agents", "skills", "CLAUDE.md"):
             src, dst = user_dir / name, home / name
-            if src.exists() and not dst.exists() and not dst.is_symlink():
-                dst.symlink_to(src)
+            if src.exists():
+                _mirror(src, dst)
     return home
 
 
@@ -899,7 +958,7 @@ def _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback) ->
     logline(f"{role} on {short_model(model)} for {task.id}{' (resumed session)' if resume_id else ''}")
     try:
         proc = subprocess.Popen(cmd, cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
+                                stderr=subprocess.PIPE, text=True, bufsize=1, **POPEN_GROUP_KW)
     except OSError as e:
         finish_round("spawn failed")
         die(f"could not start the worker process: {e}")
@@ -912,14 +971,16 @@ def _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback) ->
     def stop_worker(signum, _frame) -> None:
         # The worker runs in its own process group; take it down with us, and leave the
         # bookkeeping honest instead of a forever-"running" round.
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        kill_tree(proc)
         finish_round("interrupted")
         raise SystemExit(128 + signum)
 
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    stop_signals = [signal.SIGTERM, signal.SIGINT]
+    if hasattr(signal, "SIGHUP"):
+        stop_signals.append(signal.SIGHUP)
+    if hasattr(signal, "SIGBREAK"):
+        stop_signals.append(signal.SIGBREAK)
+    for sig in stop_signals:
         signal.signal(sig, stop_worker)
 
     def drain_stderr() -> None:
@@ -936,13 +997,10 @@ def _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback) ->
             reason = "timeout" if t - start > timeout else "idle timeout" if t - last > idle_limit else None
             if reason:
                 state["killed"] = reason
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    time.sleep(10)
-                    if proc.poll() is None:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                kill_tree(proc)
+                time.sleep(10)
+                if proc.poll() is None:
+                    kill_tree(proc, hard=True)
                 return
             time.sleep(5)
 
@@ -1274,6 +1332,10 @@ CHROME_CANDIDATES = [
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
     "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    "chrome", "msedge",
 ]
 
 
@@ -1316,7 +1378,7 @@ def cmd_shot(args) -> int:
         path.unlink(missing_ok=True)
         # Headless Chrome on macOS often keeps running after writing the file: wait for a
         # complete screenshot, then stop it ourselves.
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **POPEN_GROUP_KW)
         deadline, last_size = time.time() + 60, -1
         while time.time() < deadline:
             size = path.stat().st_size if path.exists() else -1
@@ -1326,10 +1388,7 @@ def cmd_shot(args) -> int:
                 break
             last_size = size
             time.sleep(0.5)
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        kill_tree(proc)
         if not path.exists() or path.stat().st_size == 0:
             die("headless screenshot failed (is the page reachable?)")
         if narrow:
@@ -1387,13 +1446,25 @@ def cmd_install_codex(args) -> int:
     # which proves nothing about the login-shell PATH that Codex will use.
     bin_dir = Path.home() / ".local" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
-    link = bin_dir / "multiagents"
-    target = ROOT / "bin" / "multiagents"
     existing = shutil.which("multiagents")
-    if link.is_symlink() or link.exists():
-        link.unlink()
-    link.symlink_to(target)
-    print(f"linked {link} -> {target}")
+    if IS_WINDOWS:
+        # No symlink rights needed: write .cmd (PowerShell/cmd) and sh (Git Bash) shims.
+        script = ROOT / "worker" / "multiagents.py"
+        link = bin_dir / "multiagents.cmd"
+        link.write_text("@echo off\r\nsetlocal\r\n"
+                        f"set \"MA={script}\"\r\n"
+                        "where py >nul 2>nul && ( py -3 \"%MA%\" %* ) || ( python \"%MA%\" %* )\r\n")
+        sh_shim = bin_dir / "multiagents"
+        sh_shim.write_text("#!/bin/sh\n"
+                           f"exec \"{str(ROOT / 'bin' / 'multiagents').replace(chr(92), '/')}\" \"$@\"\n")
+        print(f"wrote {link} and {sh_shim}")
+    else:
+        link = bin_dir / "multiagents"
+        target = ROOT / "bin" / "multiagents"
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(target)
+        print(f"linked {link} -> {target}")
     if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
         print(f"note: add {bin_dir} to PATH (e.g. in ~/.zshrc) so Codex shell commands can find `multiagents`")
     if existing and Path(existing).resolve() not in (link.resolve(), target.resolve()):

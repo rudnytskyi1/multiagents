@@ -27,7 +27,9 @@ security add-generic-password -s deepseek-api -a "$USER" -w      # DeepSeek dire
 ```
 
 Not on macOS: `export FIREWORKS_API_KEY=…` (or `DEEPSEEK_API_KEY`) in your shell profile, or
-write the key to `~/.multiagents/fireworks.key` / `deepseek.key` and `chmod 600` it.
+write the key to `~/.multiagents/fireworks.key` / `deepseek.key` and `chmod 600` it. On
+Windows: `%USERPROFILE%\.multiagents\fireworks.key`, or a user environment variable with the
+same name (see the Windows section in [troubleshooting.md](troubleshooting.md#windows)).
 
 ## 3. Verify
 
