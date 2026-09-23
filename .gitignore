@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .DS_Store
 .multiagents/
+.claude/scheduled_tasks.lock

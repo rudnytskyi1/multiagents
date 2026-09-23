@@ -9,4 +9,8 @@ while [ -L "$self" ]; do
   esac
 done
 here=$(cd "$(dirname "$self")" && pwd -P)
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+  echo "multiagents: python3 >= 3.9 is required (found: $(python3 -V 2>&1 || echo 'no python3'))" >&2
+  exit 2
+fi
 exec python3 "$here/../worker/multiagents.py" "$@"

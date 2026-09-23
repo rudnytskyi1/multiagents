@@ -30,7 +30,8 @@ Commit your own changes separately as `[T00N] lead: <summary>`.
 
 | Command | What it does |
 |---|---|
-| `multiagents doctor --quick` | Once per session, before the first run: checks the key, models, and credential isolation. |
+| `multiagents doctor --quick` | Once per session, before the first run: checks the key, models, provider, and credential isolation. |
+| `multiagents provider` | Shows the active provider (fireworks / deepseek). A project pins one via `{"provider": "deepseek"}` in `.claude/multiagents.json`. |
 | `multiagents new <slug> --title "<title>"` | Creates `.multiagents/tasks/T00N-<slug>/task.md` from a template for you to fill in. |
 | `multiagents run <role> T00N [--feedback feedback-N.md]` | Runs a worker. Roles: `coder`, `reviewer`, `fixer`, `scout`. |
 | `multiagents feedback T00N` | Creates the next `feedback-N.md` from the template. |
@@ -58,6 +59,9 @@ checks. For anything broader, run a **scout** worker. It is cheap and saves your
 1. `multiagents new scout-<area> --title "Scout: …"`
 2. Write the questions into its `task.md`.
 3. `multiagents run scout T00N`
+
+Scouts are enforced read-only (no editing tools, git writes denied); their report is captured
+from their final message.
 
 ### 2. Plan
 Split the work into tasks. A good task:
@@ -135,7 +139,9 @@ anything the user should check themselves.
 - Don't re-read files a worker summarized unless you are verifying a specific claim.
 
 ## Safety
-- Workers cannot push. Push or open PRs only if the user asks.
-- `multiagents accept` merges locally. Accept only after your own review.
-- Workers run with a restricted command allowlist, on a branch. Tell the user about anything
-  surprising in a worker's report, such as unrelated deleted files or odd commands.
+- Workers run with a restricted command allowlist on a task branch: plain `git push` is denied
+  and credential paths are blocked, but allowlisted interpreters (node, python) can run
+  arbitrary code — your review before `accept` is the real safety boundary, so do it properly.
+- Push or open PRs only if the user asks. `multiagents accept` merges locally, after your review.
+- Tell the user about anything surprising in a worker's report, such as unrelated deleted files
+  or odd commands.

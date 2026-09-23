@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "multiagents",
+  "version": "0.2.0",
+  "description": "Lead a team of cheap DeepSeek workers: you plan, review code and UI, and send feedback; workers (headless Claude Code processes on Fireworks or api.deepseek.com) write, test and fix the code."
+}

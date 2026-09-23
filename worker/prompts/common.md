@@ -19,10 +19,7 @@ Task: {{task_id}}, "{{title}}". Repository: {{repo}}. Branch: {{branch}}. Base c
   for the files you touched. Never claim something works unless you ran it and saw it pass. If
   you could not run something, say exactly what and why.
 - **Stay inside the repository.** Never modify files outside {{repo}}.
-- **Git.** You are on branch `{{branch}}`. When done, commit only the files you changed:
-  `git add <paths>` then `git commit -m "[{{task_id}}] <role>: <summary>"`. Never push, switch
-  branches, checkout, merge, rebase, reset, stash, clean, or rewrite history. To discard your own
-  change to a file, use `git restore <path>`.
+- **Git.** {{git_rules}}
 - **Blocked commands.** Some commands are not permitted in this environment. Do not try to get
   around a block with an equivalent command or a script that does the same thing. List it under
   "Blocked commands" in your report, including what you needed it for, and continue with what you
@@ -33,5 +30,4 @@ Task: {{task_id}}, "{{title}}". Repository: {{repo}}. Branch: {{branch}}. Base c
   instead of giving up. To keep a server or watcher running, use the Bash tool's
   `run_in_background` option instead of `&`, and stop it when you are done.
 - **Report.** The lead reads your report first, so it must be accurate, specific (paths, symbols,
-  commands, numbers), and concise. Writing it is your last step: use the Write tool to create
-  `{{report_path}}`.
+  commands, numbers), and concise. {{report_rules}}

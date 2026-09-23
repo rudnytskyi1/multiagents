@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""multiagents: run cheap DeepSeek workers (via Fireworks) for a Claude Code lead.
+"""multiagents: run cheap DeepSeek workers for a lead agent (Claude Code or Codex).
 
 The lead is your normal Claude Code session (for example Opus on a Claude subscription).
 It plans, writes task specs and reviews. This CLI runs the workers that write, test and fix
-code. Each worker is a headless `claude -p` process isolated from the lead's credentials:
+code against the configured provider (Fireworks, api.deepseek.com, or any Anthropic-compatible
+endpoint). Each worker is a headless `claude -p` process isolated from the lead's credentials:
 
   * every ANTHROPIC_* / CLAUDE* variable inherited from the host session is stripped
     (the desktop app passes its subscription auth to child processes through them),
   * the worker gets its own CLAUDE_CONFIG_DIR, so the lead's stored login is never found,
-  * the Fireworks key reaches Claude Code only through apiKeyHelper,
+  * the provider API key reaches Claude Code only through apiKeyHelper,
   * before the first real run on a given Claude Code build, a leak self-test points a worker
-    at a local capture server and refuses to continue unless only the Fireworks key was sent.
+    at a local capture server and refuses to continue unless only the canary key was sent.
 
 Only the Python standard library is used (3.9+).
 """
@@ -36,7 +37,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 ROOT = Path(__file__).resolve().parent.parent
 PROMPTS = ROOT / "worker" / "prompts"
 TEMPLATES = ROOT / "worker" / "templates"
@@ -46,16 +47,42 @@ PROJECT_CONFIG = Path(".claude") / "multiagents.json"
 TEAM_DIR = ".multiagents"
 ROLES = ("coder", "reviewer", "fixer", "scout")
 
-FLASH = "accounts/fireworks/models/deepseek-v4p1-flash"
+FW_FLASH = "accounts/fireworks/models/deepseek-v4p1-flash"
+DS_FLASH = "deepseek-flash"
 
 DEFAULT_CONFIG = {
-    "base_url": "https://api.fireworks.ai/inference",
-    "keychain_service": "fireworks-api",
-    "key_file": str(STATE_HOME / "fireworks.key"),
-    "models": {"coder": FLASH, "fixer": FLASH, "reviewer": FLASH, "scout": FLASH, "background": FLASH},
-    "aliases": {"flash": FLASH},
-    # USD per 1M tokens. Add entries for other models to get cost estimates.
-    "prices": {FLASH: {"input": 0.22, "cached_input": 0.007, "output": 0.66}},
+    # Provider-independent settings. Provider-specific ones live under "providers";
+    # the active provider's block is merged on top of these at load time.
+    "provider": "fireworks",
+    "providers": {
+        "fireworks": {
+            "label": "Fireworks AI (US)",
+            "base_url": "https://api.fireworks.ai/inference",
+            "models_url": "https://api.fireworks.ai/inference/v1/models",
+            "keychain_service": "fireworks-api",
+            "key_file": str(STATE_HOME / "fireworks.key"),
+            "key_env": "FIREWORKS_API_KEY",
+            "models": {"coder": FW_FLASH, "fixer": FW_FLASH, "reviewer": FW_FLASH,
+                       "scout": FW_FLASH, "background": FW_FLASH},
+            "aliases": {"flash": FW_FLASH},
+            # USD per 1M tokens. Add entries for other models to get cost estimates.
+            "prices": {FW_FLASH: {"input": 0.22, "cached_input": 0.007, "output": 0.66}},
+        },
+        "deepseek": {
+            "label": "DeepSeek first-party API (api.deepseek.com, China-hosted)",
+            "base_url": "https://api.deepseek.com/anthropic",
+            "models_url": "https://api.deepseek.com/models",
+            "keychain_service": "deepseek-api",
+            "key_file": str(STATE_HOME / "deepseek.key"),
+            "key_env": "DEEPSEEK_API_KEY",
+            "models": {"coder": DS_FLASH, "fixer": DS_FLASH, "reviewer": DS_FLASH,
+                       "scout": DS_FLASH, "background": DS_FLASH},
+            "aliases": {"flash": DS_FLASH, "pro": "deepseek-v4-pro"},
+            # Peak rates; DeepSeek bills 50% of this off-peak (see their pricing page).
+            "prices": {DS_FLASH: {"input": 0.30, "cached_input": 0.006, "output": 1.20},
+                       "deepseek-v4-pro": {"input": 1.32, "cached_input": 0.044, "output": 3.96}},
+        },
+    },
     "permission_mode": "acceptEdits",
     "allow": [],
     "deny": [],
@@ -67,6 +94,14 @@ DEFAULT_CONFIG = {
     "worker_env": {},
 }
 
+# A repo-committed .claude/multiagents.json is untrusted input (the repo may come from
+# anyone). Only these keys are honored from it; everything else must live in the
+# user-level ~/.multiagents/config.json.
+PROJECT_SAFE_KEYS = {
+    "provider", "models", "aliases", "prices", "allow", "deny", "permission_mode",
+    "max_turns", "timeout_minutes", "idle_timeout_minutes", "use_branches", "branch_prefix",
+}
+
 # Tools a worker may run without a prompt (anything else is denied in headless mode and
 # reported back, so the lead can extend "allow" in .claude/multiagents.json).
 DEFAULT_ALLOW = [
@@ -74,7 +109,9 @@ DEFAULT_ALLOW = [
     "Bash(wc *)", "Bash(grep *)", "Bash(rg *)", "Bash(tree *)", "Bash(diff *)", "Bash(sort *)",
     "Bash(uniq *)", "Bash(cut *)", "Bash(sed -n *)", "Bash(jq *)", "Bash(echo *)", "Bash(printf *)",
     "Bash(which *)", "Bash(file *)", "Bash(stat *)", "Bash(mkdir *)", "Bash(touch *)", "Bash(date*)",
-    "Bash(sleep *)", "Bash(ps *)", "Bash(lsof *)", "Bash(curl *)",
+    "Bash(sleep *)",
+    "Bash(curl -s localhost*)", "Bash(curl -sS localhost*)", "Bash(curl -sI localhost*)",
+    "Bash(curl -s http://localhost*)", "Bash(curl -s http://127.0.0.1*)", "Bash(curl http://localhost*)",
     "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)", "Bash(git blame*)",
     "Bash(git ls-files*)", "Bash(git rev-parse*)", "Bash(git grep *)", "Bash(git branch --show-current)",
     "Bash(git add *)", "Bash(git commit *)", "Bash(git restore *)", "Bash(git rm *)", "Bash(git mv *)",
@@ -94,9 +131,42 @@ DEFAULT_DENY = [
     "Bash(git push*)", "Bash(git reset*)", "Bash(git rebase*)", "Bash(git checkout *)",
     "Bash(git switch *)", "Bash(git merge*)", "Bash(git branch -d*)", "Bash(git branch -D*)",
     "Bash(git clean*)", "Bash(git stash*)", "Bash(git filter-branch*)", "Bash(git remote *)",
-    "Bash(git config *)", "Bash(sudo *)", "Bash(rm -rf /*)", "Bash(rm -rf ~*)", "Bash(multiagents *)",
-    "WebSearch",
+    "Bash(git config *)", "Bash(git commit --amend*)", "Bash(sudo *)", "Bash(rm -rf /*)",
+    "Bash(rm -rf ~*)", "Bash(multiagents *)", "Bash(printenv*)", "Bash(env)", "Bash(ps *)",
+    "Bash(cat /proc*)", "WebSearch",
 ]
+
+# Paths a worker has no business reading: the lead's credential stores. NOTE: ~/.claude and
+# STATE_HOME are NOT blanket-denied — the worker's own config dir lives under STATE_HOME and
+# symlinks the user's agents/skills from ~/.claude, which workers legitimately read.
+SECRET_PATHS = (
+    ".claude/.credentials.json", ".claude/settings.json", ".claude/settings.local.json",
+    ".claude.json", ".ssh", ".aws", ".config/gh", ".netrc", ".gnupg",
+)
+# Readers that take the path as their first argument (prefix rules can't catch pattern-first
+# tools like grep/jq — that residual risk is documented under "Honest limits" in the README).
+_PATH_FIRST_READERS = ("cat", "head", "tail", "less", "more", "od", "strings", "file", "stat", "wc")
+
+
+def _secret_denies() -> list:
+    home = Path.home()
+    rules = []
+    for p in SECRET_PATHS:
+        rules += [f"Read(/{home}/{p}/**)", f"Read(/{home}/{p})", f"Read(/{home}/{p}*)"]
+        for r in _PATH_FIRST_READERS:
+            rules += [f"Bash({r} {home}/{p}*)", f"Bash({r} ~/{p}*)", f"Bash({r} $HOME/{p}*)"]
+    for f in ("*.key", "*.env.key", "config.json", "selftest.json"):
+        rules.append(f"Read(/{STATE_HOME}/{f})")
+    for r in _PATH_FIRST_READERS:
+        rules += [f"Bash({r} {STATE_HOME}/config.json*)", f"Bash({r} {STATE_HOME}/selftest.json*)"]
+    rules += [f"Bash({r} {STATE_HOME}/{k}*)" for r in _PATH_FIRST_READERS
+              for k in ("fireworks", "deepseek")] + [f"Bash({r} ~/.multiagents/{k}*)"
+              for r in _PATH_FIRST_READERS for k in ("fireworks", "deepseek")]
+    return rules
+
+
+SCOUT_DENY = ["Bash(git add *)", "Bash(git commit *)", "Bash(git rm *)", "Bash(git mv *)",
+              "Bash(git restore *)", "Bash(mkdir *)", "Bash(touch *)"]
 
 # Variables kept even though they match the stripped prefixes.
 KEEP_ENV = {"CLAUDE_CODE_GIT_BASH_PATH"}
@@ -162,28 +232,77 @@ def write_json(path: Path, data) -> None:
 
 
 def git(repo: Path, *args: str, check: bool = True) -> str:
-    r = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+    try:
+        r = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+    except FileNotFoundError:
+        die("git not found on PATH (multiagents requires git)")
     if check and r.returncode != 0:
         die(f"git {' '.join(args)} failed: {r.stderr.strip() or r.stdout.strip()}")
     return r.stdout.strip()
 
 
 def repo_root() -> Path:
-    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    try:
+        r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    except FileNotFoundError:
+        die("git not found on PATH (multiagents requires git)")
     if r.returncode != 0:
         die("not inside a git repository (workers need git to track and review their changes)")
     return Path(r.stdout.strip())
 
 
 def load_config(repo: Path | None) -> dict:
-    cfg = deep_merge(DEFAULT_CONFIG, read_json(USER_CONFIG, {}) or {})
+    user = read_json(USER_CONFIG, {}) or {}
+    project = {}
     if repo is not None:
-        cfg = deep_merge(cfg, read_json(repo / PROJECT_CONFIG, {}) or {})
+        raw = read_json(repo / PROJECT_CONFIG, {}) or {}
+        ignored = sorted(set(raw) - PROJECT_SAFE_KEYS)
+        if ignored:
+            print(f"multiagents: ignoring untrusted keys in {PROJECT_CONFIG}: {', '.join(ignored)} "
+                  "(these are only honored in ~/.multiagents/config.json)", file=sys.stderr)
+        project = {k: v for k, v in raw.items() if k in PROJECT_SAFE_KEYS}
+        if project.get("permission_mode") == "bypassPermissions":
+            print(f"multiagents: {PROJECT_CONFIG} may not set bypassPermissions; ignoring", file=sys.stderr)
+            project.pop("permission_mode")
+
+    merged = deep_merge(DEFAULT_CONFIG, user)
+    sel = (os.environ.get("MULTIAGENTS_PROVIDER") or project.get("provider")
+           or merged.get("provider") or "fireworks")
+    providers = merged.get("providers") or {}
+    if sel not in providers:
+        die(f"unknown provider {sel!r} (known: {', '.join(sorted(providers))}); "
+            "define custom providers in ~/.multiagents/config.json")
+
+    # generic defaults -> selected provider block -> user top-level overrides -> project (safe keys).
+    # Endpoint/key plumbing is only accepted inside providers.<name>: a top-level override there
+    # would silently pair one vendor's key with another vendor's endpoint when the provider switches.
+    PROVIDER_ONLY = ("base_url", "models_url", "keychain_service", "key_file", "key_env", "label")
+    stray = sorted(set(user) & set(PROVIDER_ONLY))
+    if stray:
+        print(f"multiagents: ignoring top-level {', '.join(stray)} in {USER_CONFIG} — "
+              f"move them under \"providers\".\"<name>\"", file=sys.stderr)
+    cfg = {k: v for k, v in merged.items() if k not in ("providers", "provider")}
+    cfg = deep_merge(cfg, providers[sel])
+    cfg = deep_merge(cfg, {k: v for k, v in user.items()
+                           if k not in ("providers", "provider") and k not in PROVIDER_ONLY})
+    cfg = deep_merge(cfg, {k: v for k, v in project.items() if k != "provider"})
+    cfg["provider_name"] = sel
+    cfg["_providers"] = providers  # full map, e.g. so worker_env can strip every key_env
+    cfg.setdefault("models_url", cfg["base_url"].rstrip("/") + "/v1/models")
     for role in ROLES:
         env_model = os.environ.get(f"MULTIAGENTS_{role.upper()}_MODEL")
         if env_model:
             cfg["models"][role] = env_model
     return cfg
+
+
+def load_config_here() -> dict:
+    """Config for commands that may run outside a repo: use the repo's if we are in one."""
+    try:
+        r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        return load_config(Path(r.stdout.strip()) if r.returncode == 0 else None)
+    except FileNotFoundError:
+        return load_config(None)
 
 
 def resolve_model(cfg: dict, name: str) -> str:
@@ -216,9 +335,19 @@ def claude_version(binary: str) -> str:
 
 
 def key_source(cfg: dict) -> tuple[str | None, str | None]:
-    """Return (description, shell command that prints the key). Never returns the key itself."""
-    if os.environ.get("FIREWORKS_API_KEY"):
-        return "env FIREWORKS_API_KEY", "printenv FIREWORKS_API_KEY"
+    """Return (description, shell command that prints the key). Never returns the key itself.
+
+    A key found in the environment is copied into a 0600 file and served from there, so the
+    variable can always be stripped from worker processes (workers never see the key in env)."""
+    env_name = cfg.get("key_env") or ""
+    env_val = os.environ.get(env_name) if env_name else None
+    if env_val:
+        staged = STATE_HOME / f"{cfg.get('provider_name', 'default')}.env.key"
+        STATE_HOME.mkdir(parents=True, exist_ok=True)
+        fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(env_val)
+        return f"env {env_name} (staged to {staged})", f"cat {shlex.quote(str(staged))}"
     service = cfg["keychain_service"]
     if sys.platform == "darwin" and shutil.which("security"):
         r = subprocess.run(["security", "find-generic-password", "-s", service], capture_output=True)
@@ -234,13 +363,15 @@ def read_key(helper: str) -> str:
     r = subprocess.run(helper, shell=True, capture_output=True, text=True)
     key = r.stdout.strip()
     if r.returncode != 0 or not key:
-        die("could not read the Fireworks API key")
+        die("could not read the API key")
     return key
 
 
-NO_KEY_HELP = """no Fireworks API key found. Store it (do not paste it into chat), e.g. on macOS:
-  security add-generic-password -s fireworks-api -a "$USER" -w
-(the command asks for the key), or export FIREWORKS_API_KEY, or put it in ~/.multiagents/fireworks.key (chmod 600)."""
+def no_key_help(cfg: dict) -> str:
+    return (f"no API key found for provider \"{cfg.get('provider_name')}\". Store it (do not paste it into chat), "
+            f"e.g. on macOS:\n  security add-generic-password -s {cfg['keychain_service']} -a \"$USER\" -w\n"
+            f"(the command asks for the key), or export {cfg.get('key_env') or 'the key env var'}, "
+            f"or put it in {cfg['key_file']} (chmod 600).")
 
 
 # ----------------------------------------------------------------------------- worker isolation
@@ -259,10 +390,15 @@ def worker_home(cfg: dict) -> Path:
     return home
 
 
-def worker_env(cfg: dict, model: str, home: Path, base_url: str, keep_fireworks_env: bool) -> dict:
+def worker_env(cfg: dict, model: str, home: Path, base_url: str) -> dict:
     env = {k: v for k, v in os.environ.items() if not k.startswith(STRIP_PREFIXES) or k in KEEP_ENV}
-    if not keep_fireworks_env:
-        env.pop("FIREWORKS_API_KEY", None)
+    # The key reaches the worker only through apiKeyHelper; every provider's key var is stripped,
+    # and so is anything that looks like an API credential variable.
+    for prov in (cfg.get("_providers") or DEFAULT_CONFIG["providers"]).values():
+        env.pop(prov.get("key_env") or "", None)
+    env.pop(cfg.get("key_env") or "", None)
+    for name in [k for k in env if re.search(r"_(API_KEY|AUTH_TOKEN)$", k)]:
+        env.pop(name)
     fast = resolve_model(cfg, cfg["models"].get("background") or "flash")
     env.update({
         "CLAUDE_CONFIG_DIR": str(home),
@@ -286,14 +422,17 @@ def worker_env(cfg: dict, model: str, home: Path, base_url: str, keep_fireworks_
     return env
 
 
-def worker_settings(cfg: dict, helper: str) -> dict:
+def worker_settings(cfg: dict, helper: str, role: str = "coder") -> dict:
+    deny = DEFAULT_DENY + _secret_denies() + list(cfg.get("deny") or [])
+    if role == "scout":
+        deny = deny + SCOUT_DENY
     return {
         "apiKeyHelper": helper,
         "permissions": {
             "allow": DEFAULT_ALLOW + list(cfg.get("allow") or []),
-            "deny": DEFAULT_DENY + list(cfg.get("deny") or []),
+            "deny": deny,
         },
-        # Commits are written by DeepSeek, not Claude: no Claude co-author trailer.
+        # Commits are written by the worker model, not Claude: no Claude co-author trailer.
         "includeCoAuthoredBy": False,
         "attribution": {"commit": "", "pr": ""},
     }
@@ -306,11 +445,15 @@ class _Capture(http.server.BaseHTTPRequestHandler):
 
     def _handle(self) -> None:
         length = int(self.headers.get("content-length") or 0)
-        if length:
-            self.rfile.read(length)
-        creds = {k.lower(): v for k, v in self.headers.items()
-                 if k.lower() in ("authorization", "x-api-key", "x-fireworks-api-key", "cookie")}
-        _Capture.records.append({"path": self.path, "creds": creds, "beta": self.headers.get("anthropic-beta", "")})
+        body = self.rfile.read(length) if length else b""
+        headers = {k.lower(): v for k, v in self.headers.items()}
+        creds = {k: v for k, v in headers.items()
+                 if k in ("authorization", "x-api-key", "x-fireworks-api-key", "cookie")}
+        _Capture.records.append({
+            "path": self.path, "creds": creds, "beta": headers.get("anthropic-beta", ""),
+            "all_header_values": " ".join(headers.values()),
+            "body_snippet_hits": [pat for pat in ("sk-ant", "oat01", "oauth_token") if pat.encode() in body],
+        })
         body = b'{"type":"error","error":{"type":"authentication_error","message":"multiagents self-test"}}'
         self.send_response(401)
         self.send_header("content-type", "application/json")
@@ -325,21 +468,38 @@ class _Capture(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def _selftest_key(binary: str, version: str, env: dict) -> str:
-    names = ",".join(sorted(env))
-    return hashlib.sha256(f"{VERSION}|{binary}|{version}|{names}".encode()).hexdigest()[:16]
+def _selftest_key(binary: str, version: str, env: dict, cfg: dict) -> str:
+    """Cache key over everything that shapes the worker's credential surface: env NAMES, the
+    VALUES of the credential-relevant env subset (hashing every value would churn the cache on
+    PWD/TERM noise), the resolved config-dir/base-url/key plumbing, and whether the host's
+    credential stores exist (a pass recorded before login must not outlive it)."""
+    relevant = re.compile(r"^(ANTHROPIC_|CLAUDE)|_(API_KEY|AUTH_TOKEN)$|^(PATH)$")
+    env_items = json.dumps([",".join(sorted(env))] +
+                           sorted(f"{k}={v}" for k, v in env.items() if relevant.search(k)))
+    plumbing = json.dumps([cfg.get("base_url"), cfg.get("keychain_service"), cfg.get("key_file"),
+                           cfg.get("key_env"), cfg.get("worker_home"),
+                           sorted((cfg.get("worker_env") or {}).items())], default=str)
+    stores = []
+    for p in (Path.home() / ".claude" / ".credentials.json", Path.home() / ".claude.json",
+              Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")):
+        try:
+            stores.append(f"{p}:{int(p.stat().st_mtime)}")
+        except OSError:
+            stores.append(f"{p}:absent")
+    blob = "|".join([VERSION, binary, version, env_items, plumbing, ",".join(stores)])
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
 def run_selftest(cfg: dict, binary: str, force: bool = False) -> tuple[bool, str]:
     """Point an isolated worker at a local server and check which credentials it sends."""
     version = claude_version(binary)
     home = worker_home(cfg)
-    canary = "fw_selftest_" + secrets.token_hex(8)
+    canary = "canary_selftest_" + secrets.token_hex(8)
     model = resolve_model(cfg, cfg["models"]["coder"])
-    probe_env = worker_env(cfg, model, home, "http://127.0.0.1:1", keep_fireworks_env=False)
+    probe_env = worker_env(cfg, model, home, "http://127.0.0.1:1")
     cache_file = STATE_HOME / "selftest.json"
     cache = read_json(cache_file, {}) or {}
-    key = _selftest_key(binary, version, probe_env)
+    key = _selftest_key(binary, version, probe_env, cfg)
     if not force and cache.get(key, {}).get("result") == "pass":
         return True, f"cached pass for Claude Code {version}"
 
@@ -349,7 +509,7 @@ def run_selftest(cfg: dict, binary: str, force: bool = False) -> tuple[bool, str
     threading.Thread(target=server.serve_forever, daemon=True).start()
     cwd = STATE_HOME / "selftest-cwd"
     cwd.mkdir(parents=True, exist_ok=True)
-    env = worker_env(cfg, model, home, f"http://127.0.0.1:{port}", keep_fireworks_env=False)
+    env = worker_env(cfg, model, home, f"http://127.0.0.1:{port}")
     cmd = [binary, "-p", "ping", "--output-format", "json", "--max-turns", "1", "--strict-mcp-config",
            "--settings", json.dumps(worker_settings(cfg, f"echo {canary}"))]
     try:
@@ -365,18 +525,25 @@ def run_selftest(cfg: dict, binary: str, force: bool = False) -> tuple[bool, str
         problems.append("the worker sent no request to the test endpoint")
     for r in records:
         values = list(r["creds"].values())
-        if any("sk-ant" in v for v in values):
-            problems.append(f"{r['path']}: an Anthropic credential was sent")
+        for pat in ("sk-ant", "oat01"):
+            if pat in r["all_header_values"]:
+                problems.append(f"{r['path']}: an Anthropic credential appeared in a request header ({pat})")
+        if r["body_snippet_hits"]:
+            problems.append(f"{r['path']}: an Anthropic credential pattern appeared in the request body "
+                            f"({', '.join(r['body_snippet_hits'])})")
         if "oauth" in r["beta"]:
             problems.append(f"{r['path']}: request used the OAuth (subscription) beta header")
         if not any(canary in v for v in values):
-            problems.append(f"{r['path']}: request did not authenticate with the Fireworks key")
+            problems.append(f"{r['path']}: request did not authenticate with the configured API key")
     _Capture.records = []
     ok = not problems
     cache[key] = {"result": "pass" if ok else "fail", "at": now_iso(), "claude_version": version}
+    if len(cache) > 24:  # keep the newest entries only
+        for stale_key, _ in sorted(cache.items(), key=lambda kv: kv[1].get("at", ""))[:len(cache) - 24]:
+            cache.pop(stale_key)
     write_json(cache_file, cache)
     if ok:
-        return True, f"{len(records)} request(s) captured, only the Fireworks key was sent (Claude Code {version})"
+        return True, f"{len(records)} request(s) captured, only the canary API key was sent (Claude Code {version})"
     return False, "; ".join(sorted(set(problems)))
 
 
@@ -384,7 +551,7 @@ def ensure_selftest(cfg: dict, binary: str) -> None:
     ok, detail = run_selftest(cfg, binary)
     if not ok:
         die("leak self-test FAILED, refusing to start a worker: " + detail +
-            "\nThe worker could expose your Claude credentials to the Fireworks endpoint on this Claude Code build.")
+            "\nThe worker could expose your Claude credentials to the provider endpoint on this Claude Code build.")
 
 
 # ----------------------------------------------------------------------------- tasks
@@ -453,12 +620,20 @@ def dirty_files(repo: Path) -> list[str]:
     return [line for line in out.splitlines() if line.strip()]
 
 
+def current_branch(repo: Path) -> str:
+    return (git(repo, "branch", "--show-current", check=False)
+            or git(repo, "symbolic-ref", "--short", "-q", "HEAD", check=False))
+
+
 def prepare_git(cfg: dict, task: Task, role: str, allow_dirty: bool) -> None:
     repo, m = task.repo, task.meta
-    current = git(repo, "branch", "--show-current", check=False)
+    current = current_branch(repo)
     if role == "scout" and not m.get("base_commit"):
         return  # read-only research: no branch needed
     if not m.get("base_commit"):
+        if not current:
+            die("HEAD is detached (or git is too old for --show-current); check out a named branch "
+                "before starting a task, so accept/reject know where to merge back")
         dirty = dirty_files(repo)
         if dirty and not allow_dirty:
             die("working tree has uncommitted changes; commit or stash them before the first run of a task "
@@ -498,10 +673,31 @@ def read_report(task: Task, rnd: dict | None) -> str:
 def build_prompts(task: Task, role: str, n: int, report_rel: str, feedback: Path | None,
                   resuming: bool) -> tuple[str, str]:
     m = task.meta
+    # The fixer's "round" is the FEEDBACK round (matching feedback-N.md), not the global
+    # worker-round index, so its commits and report line up with the feedback file.
+    round_no = n
+    if role == "fixer" and feedback is not None:
+        round_no = feedback_number(feedback) or sum(1 for r in m.get("rounds", []) if r["role"] == "fixer") + 1
+    if role == "scout":
+        git_rules = ("This is a read-only task on the user's current branch. You must not modify, "
+                     "create, add or commit any file; editing tools are disabled and git write "
+                     "commands are denied.")
+        report_rules = (f"Your final message IS the report: end with the full report text "
+                        f"(nothing else after it). It is saved to `{report_rel}` automatically.")
+    else:
+        git_rules = ("You are on branch `{branch}`. When done, commit only the files you changed: "
+                     "`git add <paths>` then `git commit -m \"[{tid}] <role>: <summary>\"`. Never push, "
+                     "switch branches, checkout, merge, rebase, reset, stash, clean, or rewrite history. "
+                     "To discard your own change to a file, use `git restore <path>`."
+                     ).format(branch=m.get("branch", ""), tid=m["id"])
+        report_rules = f"Writing it is your last step: use the Write tool to create `{report_rel}`."
     vals = {
-        "task_id": m["id"], "title": m.get("title", ""), "branch": m.get("branch", ""),
-        "base_commit": m.get("base_commit", "")[:12], "report_path": report_rel, "round": str(n),
+        "task_id": m["id"], "title": m.get("title", ""),
+        "branch": m.get("branch") or "(none — read-only task on the current branch)",
+        "base_commit": m.get("base_commit", "")[:12] or "(none)",
+        "report_path": report_rel, "round": str(round_no),
         "repo": str(task.repo), "task_dir": task.rel(task.dir),
+        "git_rules": git_rules, "report_rules": report_rules,
     }
     system = render((PROMPTS / "common.md").read_text(), **vals) + "\n\n" + render((PROMPTS / f"{role}.md").read_text(), **vals)
     spec = (task.dir / "task.md").read_text()
@@ -532,7 +728,11 @@ def build_prompts(task: Task, role: str, n: int, report_rel: str, feedback: Path
             parts.append(f"# Implementation report (verify, don't trust)\n\n{impl or '(no report was written)'}")
             parts.append(f"Changes to review: `git diff {vals['base_commit']}` (base commit of this task) "
                          f"and `git log --oneline {vals['base_commit']}..HEAD`.")
-    parts.append(f"When you are done, write your report to `{report_rel}` (your last step).")
+    if role == "scout":
+        parts.append("When you are done, end with the full report as your final message — "
+                     "it is captured automatically. Do not try to write any file.")
+    else:
+        parts.append(f"When you are done, write your report to `{report_rel}` (your last step).")
     return system, "\n\n---\n\n".join(parts)
 
 
@@ -557,18 +757,17 @@ def cost_of(cfg: dict, model_usage: dict) -> tuple[float, bool]:
     total, known = 0.0, True
     for model, u in (model_usage or {}).items():
         p = cfg["prices"].get(model)
-        if not p:
-            known = False
-            continue
+        if not p or not all(k in p for k in ("input", "cached_input", "output")):
+            known = False  # missing or partial price entry: never crash the bookkeeping over it
+            if not p:
+                continue
         fresh = u.get("inputTokens", 0) + u.get("cacheCreationInputTokens", 0)
-        total += (fresh * p["input"] + u.get("cacheReadInputTokens", 0) * p["cached_input"]
-                  + u.get("outputTokens", 0) * p["output"]) / 1e6
+        total += (fresh * p.get("input", 0) + u.get("cacheReadInputTokens", 0) * p.get("cached_input", 0)
+                  + u.get("outputTokens", 0) * p.get("output", 0)) / 1e6
     return total, known
 
 
 def cmd_run(args) -> int:
-    if os.environ.get("MULTIAGENTS_WORKER"):
-        die("refusing to dispatch a worker from inside a worker")
     repo = repo_root()
     cfg = load_config(repo)
     task = find_task(repo, args.task)
@@ -587,32 +786,51 @@ def cmd_run(args) -> int:
     binary = claude_bin(cfg)
     source, helper = key_source(cfg)
     if not helper:
-        die(NO_KEY_HELP)
+        die(no_key_help(cfg))
     lock = acquire_lock(repo, task.id, role)
     try:
         ensure_selftest(cfg, binary)
         prepare_git(cfg, task, role, args.allow_dirty)
-        return _run_worker(args, cfg, repo, task, role, model, binary, source, helper, feedback)
+        return _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback)
     finally:
         lock.unlink(missing_ok=True)
+
+
+def lock_holder(repo: Path) -> dict | None:
+    """Return the live worker holding this repo's lock, or None (stale locks don't count).
+    A pid we may not signal (PermissionError) was recycled by another user's process —
+    all real workers run as the invoking user — so it is stale too."""
+    lock = team_dir(repo) / "worker.lock"
+    try:
+        held = json.loads(lock.read_text())  # a zero-byte/garbage lock is stale, not fatal
+        os.kill(held["pid"], 0)
+        return held
+    except (OSError, json.JSONDecodeError, ProcessLookupError, PermissionError, KeyError, TypeError):
+        return None
 
 
 def acquire_lock(repo: Path, task_id: str, role: str) -> Path:
     """Workers share the working tree, so only one may run per repository at a time."""
     lock = team_dir(repo) / "worker.lock"
-    held = read_json(lock, None) if lock.exists() else None
-    if held:
+    payload = json.dumps({"pid": os.getpid(), "task": task_id, "role": role, "started": now_iso()})
+    for attempt in (1, 2):
         try:
-            os.kill(held["pid"], 0)
-            die(f"another worker is running in this repo ({held['role']} on {held['task']}, pid {held['pid']}); "
-                "wait for it to finish")
-        except (ProcessLookupError, KeyError, TypeError):
-            pass  # stale lock
-    write_json(lock, {"pid": os.getpid(), "task": task_id, "role": role, "started": now_iso()})
-    return lock
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(payload)
+            return lock
+        except FileExistsError:
+            held = lock_holder(repo)
+            if held:
+                die(f"another worker is running in this repo ({held.get('role')} on {held.get('task')}, "
+                    f"pid {held.get('pid')}); wait for it to finish")
+            if attempt == 1:
+                lock.unlink(missing_ok=True)  # stale: remove and retry once
+    die("could not acquire the worker lock (raced with another process); try again")
+    return lock  # unreachable
 
 
-def _run_worker(args, cfg, repo, task, role, model, binary, source, helper, feedback) -> int:
+def _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback) -> int:
     rounds = task.meta.setdefault("rounds", [])
     n = len(rounds) + 1
     tag = f"{n:02d}-{role}"
@@ -629,7 +847,7 @@ def _run_worker(args, cfg, repo, task, role, model, binary, source, helper, feed
     mode = args.permission_mode or cfg["permission_mode"]
     max_turns = args.max_turns or cfg["max_turns"].get(role)
     cmd = [binary, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode,
-           "--settings", json.dumps(worker_settings(cfg, helper)), "--strict-mcp-config",
+           "--settings", json.dumps(worker_settings(cfg, helper, role)), "--strict-mcp-config",
            "--append-system-prompt", system]
     if max_turns:
         cmd += ["--max-turns", str(max_turns)]
@@ -637,10 +855,12 @@ def _run_worker(args, cfg, repo, task, role, model, binary, source, helper, feed
     if fallback != model:
         cmd += ["--fallback-model", fallback]  # used by Claude Code when the main model is overloaded
     if role == "scout":
-        cmd += ["--disallowedTools", "Edit", "NotebookEdit"]
+        # Read-only research: no editing tools at all. The report is the scout's final
+        # message, which the CLI captures to the report file itself.
+        cmd += ["--disallowedTools", "Edit", "NotebookEdit", "Write"]
     if resume_id:
         cmd += ["--resume", resume_id]
-    env = worker_env(cfg, model, worker_home(cfg), cfg["base_url"], keep_fireworks_env=source.startswith("env"))
+    env = worker_env(cfg, model, worker_home(cfg), cfg["base_url"])
 
     head_before = git(repo, "rev-parse", "HEAD")
     rnd = {"n": n, "role": role, "model": model, "started": now_iso(), "report": task.rel(report),
@@ -651,33 +871,64 @@ def _run_worker(args, cfg, repo, task, role, model, binary, source, helper, feed
     task.save()
 
     timeout = (args.timeout or cfg["timeout_minutes"]) * 60
-    idle_limit = cfg["idle_timeout_minutes"] * 60
+    # A worker is legitimately silent on stdout for the whole duration of one long tool call
+    # (nothing streams between tool_use and tool_result), so the idle limit must exceed the
+    # longest Bash call we allow the worker (BASH_MAX_TIMEOUT_MS) plus slack.
+    bash_max = int(env.get("BASH_MAX_TIMEOUT_MS", "1800000")) / 1000
+    idle_limit = max(cfg["idle_timeout_minutes"] * 60, bash_max + 300)
     start = last = time.time()
     state = {"init": None, "result": None, "killed": None, "errors": 0}
     denials: dict[str, int] = {}
 
     log = log_path.open("w", buffering=1)
     raw = raw_path.open("w", buffering=1)
+    log_lock = threading.Lock()
 
     def logline(text: str) -> None:
-        log.write(f"[{time.strftime('%H:%M:%S')}] {text}\n")
+        with log_lock:
+            if not log.closed:
+                log.write(f"[{time.strftime('%H:%M:%S')}] {text}\n")
+
+    def finish_round(outcome: str) -> None:
+        rnd.setdefault("ended", now_iso())
+        rnd.setdefault("outcome", outcome)
+        rnd["seconds"] = rnd.get("seconds") or round(time.time() - start)
+        task.meta["status"] = "error"
+        task.save()
 
     logline(f"{role} on {short_model(model)} for {task.id}{' (resumed session)' if resume_id else ''}")
-    proc = subprocess.Popen(cmd, cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
-    proc.stdin.write(prompt)
-    proc.stdin.close()
+    try:
+        proc = subprocess.Popen(cmd, cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
+    except OSError as e:
+        finish_round("spawn failed")
+        die(f"could not start the worker process: {e}")
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        logline("[stderr] worker exited before reading its prompt (see below for its error output)")
 
     def stop_worker(signum, _frame) -> None:
-        # The worker runs in its own process group; take it down with us.
+        # The worker runs in its own process group; take it down with us, and leave the
+        # bookkeeping honest instead of a forever-"running" round.
         try:
             os.killpg(proc.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
+        finish_round("interrupted")
         raise SystemExit(128 + signum)
 
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, stop_worker)
+
+    def drain_stderr() -> None:
+        for line in proc.stderr:
+            if line.strip() and not NOISE.search(line):
+                logline("[stderr] " + line.strip()[:300])
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
 
     def watchdog() -> None:
         while proc.poll() is None:
@@ -740,16 +991,24 @@ def _run_worker(args, cfg, repo, task, role, model, binary, source, helper, feed
                 label = d.get("tool_name", "?") + (f"({inp['command'][:80]})" if "command" in inp else "")
                 denials[label] = denials.get(label, 0) + 1
     proc.wait()
+    stderr_thread.join(timeout=10)  # let the worker's last error lines land in the log
     elapsed = time.time() - start
-    log.close()
+    with log_lock:
+        log.close()
     raw.close()
 
     res = state["result"] or {}
     if not report.exists() and res.get("result"):
-        report.write_text(f"# {task.id} {role} report (auto-captured: the worker did not write a report)\n\n{res['result']}\n")
+        text = str(res["result"])
+        if text.lstrip().startswith("#"):
+            report.write_text(text + "\n")  # the worker's message already carries a heading
+        else:
+            note = "" if role == "scout" else " (auto-captured: the worker did not write a report)"
+            report.write_text(f"# {task.id} {role} report{note}\n\n{text}\n")
     report_text = report.read_text() if report.exists() else ""
-    status_match = re.search(r"^\s*(?:\*\*)?(Status|Verdict)(?:\*\*)?\s*:\s*\**\s*([A-Z_]+)", report_text, re.M)
-    worker_status = status_match.group(2) if status_match else "UNKNOWN"
+    status_match = re.search(r"^\s*(?:\*\*)?(status|verdict)(?:\*\*)?\s*:\s*\**\s*([A-Za-z_]+)",
+                             report_text, re.M | re.I)
+    worker_status = status_match.group(2).upper() if status_match else "UNKNOWN"
     cost, cost_known = cost_of(cfg, res.get("modelUsage") or {})
     usage = {"input": 0, "cached": 0, "output": 0}
     for u in (res.get("modelUsage") or {}).values():
@@ -766,7 +1025,10 @@ def _run_worker(args, cfg, repo, task, role, model, binary, source, helper, feed
         "tokens": usage, "cost_usd": round(cost, 4) if cost_known else None, "head_after": head_after,
         "uncommitted": len(uncommitted), "denied": denials,
     })
-    task.meta["status"] = {"coder": "implemented", "fixer": "fixed", "reviewer": "reviewed", "scout": "scouted"}[role]
+    if outcome == "success":
+        task.meta["status"] = {"coder": "implemented", "fixer": "fixed", "reviewer": "reviewed", "scout": "scouted"}[role]
+    else:
+        task.meta["status"] = "error"  # honest at the task level; the round row has the detail
     task.save()
 
     base = task.meta.get("base_commit")  # scouts never set one
@@ -785,7 +1047,7 @@ def _run_worker(args, cfg, repo, task, role, model, binary, source, helper, feed
     if state["errors"]:
         print(f"tool errors during run: {state['errors']} (details: {task.rel(log_path)})")
     if state.get("retries"):
-        print(f"API retries: {state['retries']} (Fireworks was slow or flaky for {short_model(model)})")
+        print(f"API retries: {state['retries']} ({cfg['provider_name']} was slow or flaky for {short_model(model)})")
     print(f"report: {task.rel(report)}   log: {task.rel(log_path)}")
     print("----- report -----")
     lines = report_text.splitlines()
@@ -812,11 +1074,19 @@ def cmd_new(args) -> int:
     return 0
 
 
+def feedback_number(path: Path) -> int | None:
+    m = re.match(r"feedback-(\d+)\.md$", path.name)
+    return int(m.group(1)) if m else None
+
+
 def cmd_feedback(args) -> int:
     repo = repo_root()
     task = find_task(repo, args.task)
-    n = len(list(task.dir.glob("feedback-*.md"))) + 1
+    nums = [feedback_number(p) for p in task.dir.glob("feedback-*.md")]
+    n = max([x for x in nums if x] or [0]) + 1
     path = task.dir / f"feedback-{n}.md"
+    if path.exists():
+        die(f"{task.rel(path)} already exists")
     path.write_text(render((TEMPLATES / "feedback.md").read_text(), task_id=task.id, round=str(n)))
     print(f"{task.rel(path)} created (fill it in, then: multiagents run fixer {task.id} --feedback {path.name})")
     return 0
@@ -834,9 +1104,11 @@ def cmd_status(args) -> int:
         rounds = m.get("rounds", [])
         spent = sum(r.get("cost_usd") or 0 for r in rounds)
         print(f"{m['id']}  {m.get('status', '?'):<12} {m.get('title', '')}  [{t.rel(t.dir)}]")
+        live = lock_holder(repo)
         for r in rounds if args.task or args.verbose else rounds[-3:]:
             cost = f"${r['cost_usd']:.3f}" if r.get("cost_usd") is not None else "-"
-            print(f"   {r['n']:>2}. {r['role']:<8} {short_model(r['model']):<24} {r.get('outcome', 'running'):<16} "
+            outcome = r.get("outcome") or ("running" if live and live.get("task") == m["id"] else "interrupted")
+            print(f"   {r['n']:>2}. {r['role']:<8} {short_model(r['model']):<24} {outcome:<16} "
                   f"{r.get('worker_status', ''):<16} {fmt_secs(r.get('seconds', 0)):>7} {cost:>8}")
         if rounds:
             print(f"   total est. cost: ${spent:.3f}")
@@ -863,6 +1135,13 @@ def cmd_accept(args) -> int:
     m = task.meta
     if not m.get("base_commit"):
         die(f"{task.id} has no work to accept")
+    held = lock_holder(repo)
+    if held:
+        die(f"a worker is running in this repo ({held.get('role')} on {held.get('task')}); "
+            "accepting now would switch branches under it — wait for it to finish")
+    if m.get("branch") and not m.get("base_branch"):
+        die(f"{task.id} has no recorded base branch (it was started from a detached HEAD); "
+            f"merge {m['branch']} manually")
     if dirty_files(repo):
         die("uncommitted changes in the working tree; commit (or discard) them before accepting")
     if m.get("branch") and m.get("base_branch") and m["branch"] != m["base_branch"]:
@@ -883,7 +1162,13 @@ def cmd_reject(args) -> int:
     repo = repo_root()
     task = find_task(repo, args.task)
     m = task.meta
-    if m.get("base_branch") and git(repo, "branch", "--show-current", check=False) != m["base_branch"]:
+    held = lock_holder(repo)
+    if held:
+        die(f"a worker is running in this repo ({held.get('role')} on {held.get('task')}); "
+            "wait for it to finish before rejecting")
+    if m.get("branch") and m["branch"] != m.get("base_branch") and not m.get("base_branch"):
+        die(f"{task.id} has no recorded base branch; switch branches manually, then re-run reject")
+    if m.get("base_branch") and current_branch(repo) != m["base_branch"]:
         if dirty_files(repo):
             die("uncommitted changes in the working tree; commit or discard them first")
         git(repo, "checkout", m["base_branch"])
@@ -914,8 +1199,12 @@ def http_json(url: str, key: str, payload: dict | None = None, timeout: int = 60
         conf = "".join(f'header = "{k}: {v}"\n' for k, v in headers.items())
         if data:
             conf += "data = " + json.dumps(data.decode()) + "\n"
-        r = subprocess.run(["curl", "-sS", "-m", str(timeout), "-w", "\n%{http_code}", "-K", "-", url],
-                           input=conf, capture_output=True, text=True)
+        try:
+            r = subprocess.run(["curl", "-sS", "-m", str(timeout), "-w", "\n%{http_code}", "-K", "-", url],
+                               input=conf, capture_output=True, text=True)
+        except FileNotFoundError:
+            die("python has no CA certificates and curl is not installed; "
+                "install curl or python certifi to talk to the API")
         body, _, code = r.stdout.rpartition("\n")
         return int(code or 0), json.loads(body or "{}")
 
@@ -934,24 +1223,25 @@ def cmd_doctor(args) -> int:
     cfg = load_config(repo)
     binary = claude_bin(cfg)
     line("claude", "OK", f"{binary} ({claude_version(binary)})")
+    line("provider", "OK", f"{cfg['provider_name']} — {cfg.get('label', cfg['base_url'])}")
     source, helper = key_source(cfg)
     if not helper:
         line("api key", "FAIL", "not found")
-        print("\n" + NO_KEY_HELP)
+        print("\n" + no_key_help(cfg))
         return 1
     line("api key", "OK", source)
     key = read_key(helper)
     try:
-        code, body = http_json(cfg["base_url"] + "/v1/models", key)
+        code, body = http_json(cfg["models_url"], key)
         ids = [m.get("id", "") for m in body.get("data", [])] if code == 200 else []
-        line("fireworks", "OK" if code == 200 else "FAIL", f"HTTP {code}, {len(ids)} models visible")
+        line("endpoint", "OK" if code == 200 else "FAIL", f"HTTP {code}, {len(ids)} models visible")
         ok &= code == 200
         wanted = sorted({resolve_model(cfg, cfg["models"][r]) for r in ROLES})
         for model in wanted:
             roles = [r for r in ROLES if resolve_model(cfg, cfg["models"][r]) == model]
             if args.quick:
                 seen = model in ids
-                line("model", "OK" if seen else "WARN", f"{short_model(model)} ({', '.join(roles)}) {'listed' if seen else 'not in /v1/models list'}")
+                line("model", "OK" if seen else "WARN", f"{short_model(model)} ({', '.join(roles)}) {'listed' if seen else 'not in the models list'}")
                 continue
             t0 = time.time()
             code, body = http_json(cfg["base_url"] + "/v1/messages", key,
@@ -962,7 +1252,7 @@ def cmd_doctor(args) -> int:
             line("model", "OK" if good else "FAIL", f"{short_model(model)} ({', '.join(roles)}) {detail}")
     except Exception as e:  # network problems should not hide the other checks
         ok = False
-        line("fireworks", "FAIL", str(e)[:200])
+        line("endpoint", "FAIL", str(e)[:200])
     del key
     passed, detail = run_selftest(cfg, binary, force=args.force)
     ok &= passed
@@ -996,6 +1286,8 @@ def cmd_shot(args) -> int:
     name = re.sub(r"[^A-Za-z0-9._-]+", "-", args.name)
     path = shots / (name if name.endswith(".png") else name + ".png")
     if args.ios:
+        if not shutil.which("xcrun"):
+            die("--ios needs macOS with the Xcode command-line tools (xcrun not found)")
         r = subprocess.run(["xcrun", "simctl", "io", args.device, "screenshot", str(path)], capture_output=True, text=True)
         if r.returncode != 0:
             die("simulator screenshot failed: " + (r.stderr.strip() or r.stdout.strip()))
@@ -1003,13 +1295,16 @@ def cmd_shot(args) -> int:
         chrome = next((c for c in CHROME_CANDIDATES if (os.path.isfile(c) or shutil.which(c))), None)
         if not chrome:
             die("no Chrome/Chromium/Edge found for headless screenshots")
-        width, height, target = args.width, args.height, args.url
+        url = args.url if "://" in args.url else "http://" + args.url
+        width, height, target = args.width, args.height, url
         narrow = width < 500  # headless Chrome never lays out narrower than 500px: frame the page
         if narrow:
             wrapper = STATE_HOME / "shot-frame.html"
             # Centred, so the (always centred) crop below keeps exactly the framed page.
+            # Note: a page served with X-Frame-Options/CSP frame-ancestors will refuse to
+            # render inside this frame — if the narrow shot comes out blank, retry >= 500px.
             wrapper.write_text('<!doctype html><body style="margin:0;display:flex;justify-content:center">'
-                               f'<iframe src="{html.escape(args.url, quote=True)}" width="{width}" height="{height}" '
+                               f'<iframe src="{html.escape(url, quote=True)}" width="{width}" height="{height}" '
                                'style="border:0;display:block"></iframe></body>')
             target = wrapper.as_uri()
         cmd = [shutil.which(chrome) or chrome, "--headless=new", "--disable-gpu", "--hide-scrollbars",
@@ -1037,9 +1332,16 @@ def cmd_shot(args) -> int:
             pass
         if not path.exists() or path.stat().st_size == 0:
             die("headless screenshot failed (is the page reachable?)")
-        if narrow and shutil.which("sips"):
-            subprocess.run(["sips", "-c", str(height), str(width), str(path)],
-                           capture_output=True)
+        if narrow:
+            if shutil.which("sips"):
+                subprocess.run(["sips", "-c", str(height), str(width), str(path)], capture_output=True)
+            elif shutil.which("magick") or shutil.which("convert"):
+                tool = shutil.which("magick") or shutil.which("convert")
+                subprocess.run([tool, str(path), "-gravity", "center", "-crop", f"{width}x{height}+0+0",
+                                "+repage", str(path)], capture_output=True)
+            else:
+                print(f"note: no image cropper found (sips/ImageMagick) — the image is 500px wide "
+                      f"with the {width}px page centred in it", file=sys.stderr)
     else:
         die("give --url <address> (web page, headless Chrome) or --ios (booted simulator)")
     print(task.rel(path))
@@ -1047,13 +1349,13 @@ def cmd_shot(args) -> int:
 
 
 def cmd_models(args) -> int:
-    cfg = load_config(None)
+    cfg = load_config_here()
     _, helper = key_source(cfg)
     if not helper:
-        die(NO_KEY_HELP)
-    code, body = http_json(cfg["base_url"] + "/v1/models", read_key(helper))
+        die(no_key_help(cfg))
+    code, body = http_json(cfg["models_url"], read_key(helper))
     if code != 200:
-        die(f"Fireworks returned HTTP {code}")
+        die(f"{cfg['provider_name']} returned HTTP {code}")
     ids = sorted(m.get("id", "") for m in body.get("data", []))
     for i in ids:
         if args.all or args.filter.lower() in i.lower():
@@ -1062,20 +1364,75 @@ def cmd_models(args) -> int:
 
 
 def cmd_selftest(args) -> int:
-    cfg = load_config(None)
+    cfg = load_config_here()
     passed, detail = run_selftest(cfg, claude_bin(cfg), force=True)
     print(("PASS: " if passed else "FAIL: ") + detail)
     return 0 if passed else 1
 
 
+def cmd_install_codex(args) -> int:
+    """Install the lead skill into OpenAI Codex (~/.agents/skills) and put the CLI on PATH."""
+    src = ROOT / "codex" / "skills" / "multiagents-lead"
+    if not (src / "SKILL.md").is_file():
+        die(f"bundled Codex skill not found at {src}")
+    dest_root = Path(args.dir).expanduser() if args.dir else Path.home() / ".agents" / "skills"
+    dest = dest_root / "multiagents-lead"
+    dest_root.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest)
+    print(f"installed Codex skill: {dest}")
+
+    # Always create the link: inside a Claude Code session the plugin's own bin/ is on PATH,
+    # which proves nothing about the login-shell PATH that Codex will use.
+    bin_dir = Path.home() / ".local" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    link = bin_dir / "multiagents"
+    target = ROOT / "bin" / "multiagents"
+    existing = shutil.which("multiagents")
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(target)
+    print(f"linked {link} -> {target}")
+    if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
+        print(f"note: add {bin_dir} to PATH (e.g. in ~/.zshrc) so Codex shell commands can find `multiagents`")
+    if existing and Path(existing).resolve() not in (link.resolve(), target.resolve()):
+        print(f"note: another `multiagents` is already on PATH at {existing}; it will win over the new link")
+    if "plugins/cache" in str(ROOT):
+        print("note: this install came from the Claude Code plugin cache, whose path changes on "
+              "plugin updates — re-run `multiagents install-codex` after updating the plugin")
+    print("done. In Codex, start a NEW session and invoke it as: $multiagents-lead <task>")
+    print("Workers still run on the Claude Code engine — the `claude` CLI must be installed.")
+    return 0
+
+
+def cmd_provider(args) -> int:
+    cfg = load_config_here()
+    known = sorted((deep_merge(DEFAULT_CONFIG, read_json(USER_CONFIG, {}) or {})).get("providers", {}))
+    if not args.name:
+        print(f"active: {cfg['provider_name']} — {cfg.get('label', cfg['base_url'])}")
+        print("available: " + ", ".join(known))
+        print("set the default with: multiagents provider <name>; per project via "
+              '{"provider": "<name>"} in .claude/multiagents.json')
+        return 0
+    if args.name not in known:
+        die(f"unknown provider {args.name!r} (available: {', '.join(known)})")
+    user = read_json(USER_CONFIG, {}) or {}
+    user["provider"] = args.name
+    write_json(USER_CONFIG, user)
+    print(f"default provider set to {args.name} (in {USER_CONFIG})")
+    return 0
+
+
 # ----------------------------------------------------------------------------- main
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="multiagents", description="Run DeepSeek workers (via Fireworks) for a Claude Code lead.")
+    p = argparse.ArgumentParser(prog="multiagents",
+                                description="Run cheap DeepSeek workers (Fireworks or api.deepseek.com) for a lead agent.")
     p.add_argument("--version", action="version", version=f"multiagents {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("doctor", help="check claude, key, Fireworks, models and credential isolation")
+    s = sub.add_parser("doctor", help="check claude, key, provider, models and credential isolation")
     s.add_argument("--quick", action="store_true", help="skip the per-model test requests")
     s.add_argument("--force", action="store_true", help="re-run the leak self-test even if cached")
     s.set_defaults(fn=cmd_doctor)
@@ -1083,10 +1440,18 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("selftest", help="re-run the credential leak self-test")
     s.set_defaults(fn=cmd_selftest)
 
-    s = sub.add_parser("models", help="list models your Fireworks key can see")
+    s = sub.add_parser("models", help="list models your API key can see (active provider)")
     s.add_argument("filter", nargs="?", default="deepseek")
     s.add_argument("--all", action="store_true")
     s.set_defaults(fn=cmd_models)
+
+    s = sub.add_parser("provider", help="show or set the active provider (fireworks, deepseek, ...)")
+    s.add_argument("name", nargs="?")
+    s.set_defaults(fn=cmd_provider)
+
+    s = sub.add_parser("install-codex", help="install the lead skill into OpenAI Codex (~/.agents/skills)")
+    s.add_argument("--dir", help="skills directory to install into (default ~/.agents/skills)")
+    s.set_defaults(fn=cmd_install_codex)
 
     s = sub.add_parser("new", help="create a task folder with a spec template")
     s.add_argument("slug", help="short name, e.g. login-validation")
@@ -1096,7 +1461,7 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("run", help="run a worker on a task (blocks until it finishes)")
     s.add_argument("role", choices=ROLES)
     s.add_argument("task", help="task id, e.g. T001")
-    s.add_argument("--model", help="Fireworks model id or alias (flash)")
+    s.add_argument("--model", help="provider model id or alias (flash)")
     s.add_argument("--feedback", help="feedback file for the fixer (relative to the task folder or cwd)")
     s.add_argument("--fresh", action="store_true", help="fixer: start a new session instead of resuming the coder's")
     s.add_argument("--max-turns", type=int)
@@ -1141,6 +1506,9 @@ def main(argv: list[str] | None = None) -> int:
     s.set_defaults(fn=cmd_reject)
 
     args = p.parse_args(argv)
+    if os.environ.get("MULTIAGENTS_WORKER") and args.cmd in ("run", "accept", "reject", "new", "feedback", "shot"):
+        print(f"multiagents: workers may not run '{args.cmd}' (team commands belong to the lead)", file=sys.stderr)
+        return 2
     try:
         return args.fn(args)
     except Fail as e:
