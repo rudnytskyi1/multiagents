@@ -5,7 +5,7 @@
 In any Claude Code session:
 
 ```
-/plugin marketplace add <github-user>/multiagents
+/plugin marketplace add rudnytskyi1/multiagents
 /plugin install multiagents@multiagents
 ```
 

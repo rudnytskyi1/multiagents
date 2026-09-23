@@ -47,11 +47,11 @@ you ──► lead (your Claude Code / Codex session)
 ### Claude Code
 
 ```
-/plugin marketplace add <github-user>/multiagents
+/plugin marketplace add rudnytskyi1/multiagents
 /plugin install multiagents@multiagents
 ```
 
-CLI equivalents: `claude plugin marketplace add <github-user>/multiagents` then
+CLI equivalents: `claude plugin marketplace add rudnytskyi1/multiagents` then
 `claude plugin install multiagents@multiagents`. For a local clone, pass the folder path
 instead. Plugins installed with the CLI also load in the desktop app's Code tab.
 

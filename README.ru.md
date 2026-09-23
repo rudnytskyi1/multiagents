@@ -22,7 +22,7 @@ UI. Воркеры — headless-процессы Claude Code на моделях
 ## Установка
 
 ```
-/plugin marketplace add <github-user>/multiagents
+/plugin marketplace add rudnytskyi1/multiagents
 /plugin install multiagents@multiagents
 ```
 
