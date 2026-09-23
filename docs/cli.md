@@ -41,12 +41,19 @@ Runs one worker to completion (blocking; minutes). Roles: `coder`, `reviewer`, `
 | `--permission-mode <mode>` | `acceptEdits` (default), `bypassPermissions`, `dontAsk`, `manual` |
 | `--allow-dirty` | first run of a task: tolerate uncommitted changes in the tree |
 
-The first run of a task snapshots `base_commit`/`base_branch` and creates the `ma/` branch
-(clean tree and a named branch required; scouts skip all of this). The summary printed at the
-end: outcome (`success` / `timeout` / `idle timeout` / `interrupted` / `error during execution` /
+The first run of a task snapshots `base_commit`/`base_branch` and creates the task's own
+**git worktree** under `.multiagents/worktrees/` on branch `ma/T00N-…` (a named branch is
+required; the main tree may stay dirty — the worker starts from the last commit). Independent
+tasks can therefore run **in parallel**: one worker per task, any number of tasks. Scouts skip
+all of this and run read-only in the main tree. NOTE: a worktree is a clean checkout — nothing
+git-ignored (node_modules, .venv, Pods, .env) is in it; put bootstrap commands into the spec's
+Verification, or share paths via `"worktree_link"` in config. The summary printed at the end:
+outcome (`success` / `timeout` / `idle timeout` / `interrupted` / `error during execution` /
 `exit N`), the report's own `Status`/`Verdict`, turns, duration, token counts, estimated cost,
 new commits and diff stat vs base, uncommitted files, denied commands, tool errors, API
-retries — then the report body. Task id may be given as `T001`, `t1` or `1`.
+retries — then the report **digest** (verdict + decision-relevant sections; scouts and failed
+rounds print the full report; the full text always stays on disk). Task id may be given as
+`T001`, `t1` or `1`.
 
 ## `multiagents feedback <task>`
 
@@ -62,27 +69,45 @@ Saves a PNG into the task's `shots/` folder and prints its path.
   framing (X-Frame-Options/CSP) come out blank below 500px; retry at ≥ 500.
 - `--ios` — `xcrun simctl` screenshot of the booted simulator (`--device` to pick one).
 
+## `multiagents digest <task> [--all]`
+
+Zero-model review packet for the lead: for the last two rounds (or all with `--all`), the
+report's verdict plus only its decision-relevant sections (problems, risks, notes, questions,
+verification, review agents), then the diff stat vs base and the task's worker cost. Read this
+before opening any full report.
+
+## `multiagents sync <task>`
+
+Merges the task's base branch into its worktree, so a long-lived parallel task absorbs what was
+accepted after it started. On conflicts the worktree is left mid-merge with the conflicted
+files listed — resolve there (yourself, or a fixer round told to resolve the merge), commit,
+then `accept`.
+
 ## `multiagents status [task] [-v]`
 
 Tasks with status and, per round: role, model, outcome, worker status, duration, estimated cost,
 plus the per-task total. Without a task id shows the last 3 rounds each (`-v` for all). Rounds
 whose process died without closing are shown as `interrupted`.
 
-## `multiagents diff <task> [--stat] [-- <paths>…]`
+## `multiagents diff <task> [--stat] [--last] [-- <paths>…]`
 
 `git diff` of the task against its `base_commit` (works from any branch by diffing the task
-branch). `--stat` for the summary form.
+branch). `--stat` for the summary form; `--last` shows only the LAST round's commits (and
+refuses if that round committed nothing) — the cheap re-review after a fixer round. Uncommitted
+changes sitting in the task worktree are flagged on stderr but not shown.
 
 ## `multiagents accept <task> [--squash]`
 
-Refuses while a worker is running or if the tree is dirty. Checks out `base_branch`, merges the
-task branch (`--no-ff` with a `Merge T00N: <title>` message, or `--squash` into a single
-commit), marks the task `accepted`.
+Refuses while that task's worker is running, if the task worktree has uncommitted changes, or
+if the main tree is dirty or not on `base_branch`. Merges the task branch into `base_branch`
+(`--no-ff` with a `Merge T00N: <title>` message, or `--squash`), removes the task's worktree,
+and marks the task `accepted`. A conflicting merge is aborted cleanly with a pointer to
+`multiagents sync`.
 
 ## `multiagents reject <task>`
 
-Returns to `base_branch` (tree must be clean) and marks the task `rejected`; the `ma/` branch
-is kept for reference.
+Removes the task's worktree (work stays on the `ma/` branch for reference) and marks the task
+`rejected`. Legacy inline tasks are returned to `base_branch` first.
 
 ## `multiagents selftest`
 

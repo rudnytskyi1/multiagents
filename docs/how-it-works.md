@@ -45,19 +45,27 @@ States: `draft → in_progress/in_review/fixing/scouting → implemented/reviewe
 accepted | rejected`, with `error` whenever a round ends in anything but success and
 `interrupted` stamped on rounds cut short by a signal.
 
-### Git model
+### Git model: a worktree per task
 
-- The first `run` on a task records `base_commit`/`base_branch` and creates `ma/T00N-<slug>`
-  from the current branch. It requires a clean tree (`--allow-dirty` overrides) and refuses a
-  detached HEAD.
+- The first `run` on a task records `base_commit`/`base_branch` (a named branch is required)
+  and creates a **git worktree** — an extra checkout of the same repository — at
+  `.multiagents/worktrees/T00N-<slug>/` on its own branch `ma/T00N-<slug>`. The user's main
+  tree is never switched and may stay dirty; the worker starts from the last commit. A
+  worktree is a clean checkout: git-ignored state (node_modules, .venv, Pods, .env) is absent —
+  bootstrap in the spec's Verification, or share paths via `"worktree_link"`.
+- **Independent tasks run in parallel**: each has its own worktree, so workers cannot touch
+  each other's files. One worker per task at a time (`<task dir>/worker.lock`, atomic and
+  stale-tolerant).
 - Workers commit as `[T00N] <role>: <summary>` — no Claude attribution trailer, since the code
   is written by the worker model.
-- `multiagents diff T00N` always compares against `base_commit`, from any branch.
-- `multiagents accept` merges the task branch back into `base_branch` (`--no-ff`, or `--squash`);
-  `reject` returns to `base_branch` and keeps the task branch for reference.
-- One repo, one worker at a time: `.multiagents/worker.lock` (atomic create, stale-tolerant, and
-  respected by `accept`/`reject` so nothing switches branches under a live worker).
-- Scouts are the exception: read-only, no branch, no clean-tree requirement.
+- `multiagents diff T00N` compares the task branch against `base_commit` from anywhere;
+  `--last` shows only the latest round's commits.
+- `multiagents accept` (main tree clean, on `base_branch`, task idle) merges `--no-ff` or
+  `--squash`, then removes the worktree. A conflicting merge aborts cleanly; `multiagents
+  sync T00N` merges the base INTO the task worktree so conflicts are resolved on the task side
+  (by hand or by a fixer round). `reject` removes the worktree and keeps the branch.
+- Scouts are the exception: read-only, no branch or worktree, they run in the main tree.
+- Legacy mode (`"worktrees": false`): the old single-worker checkout flow in the main tree.
 
 ## Roles
 
@@ -111,7 +119,8 @@ lost.
   `prices` config (never from Claude Code's own cost fields, which assume Anthropic pricing);
 - prints a summary the lead can act on: outcome, worker status, turns, duration, tokens, cost,
   new commits, diff stat vs base, uncommitted files, denied commands, tool errors, API retries —
-  followed by the report itself.
+  followed by the report **digest** (verdict + problems/risks/notes/decisions; scouts and failed
+  rounds print in full). `multiagents digest T00N` re-prints it any time, with a diff stat.
 
 Exit code 0 means the worker session ended in `success`; anything else (timeout, interrupt,
 API failure, max turns) is nonzero.

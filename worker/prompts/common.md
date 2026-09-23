@@ -18,14 +18,15 @@ Task: {{task_id}}, "{{title}}". Repository: {{repo}}. Branch: {{branch}}. Base c
 - **Verify for real.** Build and run the tests or checks named in the task, plus the obvious ones
   for the files you touched. Never claim something works unless you ran it and saw it pass. If
   you could not run something, say exactly what and why.
-- **Stay inside the repository.** Never modify files outside {{repo}}.
+- **Stay inside the repository.** Never modify files outside {{repo}} — the one exception is
+  your report file in the task folder.
 - **Git.** {{git_rules}}
 - **Blocked commands.** Some commands are not permitted in this environment. Do not try to get
   around a block with an equivalent command or a script that does the same thing. List it under
   "Blocked commands" in your report, including what you needed it for, and continue with what you
   can do. The lead can allow it for the next round.
-- **Team files.** `.multiagents/` holds team bookkeeping. Do not edit anything there except your
-  own report.
+- **Team files.** `{{task_dir}}` holds this task's bookkeeping (spec, feedback, reports). Do
+  not edit anything there except your own report.
 - **Long operations.** Builds and test suites may take minutes. Give Bash a long enough timeout
   instead of giving up. To keep a server or watcher running, use the Bash tool's
   `run_in_background` option instead of `&`, and stop it when you are done.

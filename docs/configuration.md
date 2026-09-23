@@ -29,7 +29,7 @@ it (everything else is ignored with a warning):
 
 `provider`, `models`, `aliases`, `prices`, `allow`, `deny`, `permission_mode` (anything except
 `bypassPermissions`), `max_turns`, `timeout_minutes`, `idle_timeout_minutes`, `use_branches`,
-`branch_prefix`.
+`worktrees`, `branch_prefix`.
 
 Endpoint and key plumbing (`base_url`, `models_url`, `keychain_service`, `key_file`, `key_env`),
 `claude_bin`, `worker_home`, `worker_env` and `providers` definitions are **user-config only**.
@@ -58,6 +58,8 @@ the provider switches, so top-level copies are ignored with a warning.
 | `timeout_minutes` | 60 | user, project | hard wall-clock cap per run |
 | `idle_timeout_minutes` | 15 | user, project | silence cap; effective value is always ≥ max Bash timeout + 5 min |
 | `use_branches` | `true` | user, project | create `ma/T00N-<slug>` per task |
+| `worktrees` | `true` | user, project | give each task its own git worktree (parallel tasks; the main tree is never switched). Off = legacy single-worker checkout mode |
+| `worktree_link` | `[]` | user, project | git-ignored paths linked from the main tree into each new worktree (e.g. `["node_modules", ".env"]`) so workers build without re-bootstrapping; linked paths are SHARED between parallel tasks |
 | `branch_prefix` | `"ma/"` | user, project | task branch prefix |
 | `worker_env` | `{}` | user | extra env vars for workers |
 | `worker_home` | `~/.multiagents/worker-home` | user | the workers' `CLAUDE_CONFIG_DIR` |

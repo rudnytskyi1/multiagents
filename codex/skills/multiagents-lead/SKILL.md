@@ -32,6 +32,8 @@ provider. Worker runs need network access: if your sandbox asks for approval whe
 | `multiagents feedback T00N` | Creates the next `feedback-N.md` from a template. |
 | `multiagents shot T00N <name> --url <url> [--width 360 --height 740] [--dark]` / `--ios` | Saves a screenshot into the task's `shots/` folder for the fixer (a vision model). |
 | `multiagents status [T00N]` | Tasks, rounds, verdicts, time, cost. |
+| `multiagents digest T00N` | Verdicts + key report sections + diff stat — read this before any full report. |
+| `multiagents sync T00N` | Merge the base branch into a parallel task's worktree. |
 | `multiagents diff T00N [--stat] [-- paths…]` | The task's changes vs its base commit. |
 | `multiagents accept T00N [--squash]` / `reject T00N` | Merge the task branch / abandon it. |
 
@@ -46,14 +48,17 @@ Never print, echo, or ask for API keys.
 3. **Spec.** The worker knows nothing from this conversation. `task.md` must carry exact file
    paths, names, data shapes, edge cases, what NOT to touch, exact build/test commands, the
    review agents to run (from the repo's `.claude/agents/`), and UI notes. The first run of a
-   task needs a clean git tree and creates branch `ma/T00N-<slug>`; if the tree is dirty, ask
-   the user whether to commit or stash — never do it silently.
+   task creates branch `ma/T00N-<slug>` in its own git worktree from the last commit of the
+   current branch (the main tree may stay dirty; uncommitted changes are NOT seen by workers).
 4. **Implement.** `multiagents run coder T00N`. BLOCKED/PARTIAL → improve the spec and rerun.
    Denied commands are listed in the summary — add safe ones to `"allow"` in
    `.claude/multiagents.json` and tell the user.
 5. **Worker review.** `multiagents run reviewer T00N` — it rebuilds, retests, runs the review
-   agents, and fixes what it finds.
-6. **Your review.** Read the reports as claims, not facts. Check `multiagents diff T00N --stat`,
+   agents, and fixes what it finds. Each task runs in its own git worktree, so independent
+   tasks may run in parallel — one worker per task, and never two tasks over the same files.
+6. **Your review.** Read the digest first; open full reports and full diffs only when the
+   digest, a non-PASS verdict, missing tests, or security-critical code gives you a reason.
+   After a fixer round, review `multiagents diff T00N --last` only. Read the reports as claims, not facts. Check `multiagents diff T00N --stat`,
    then the important hunks. For UI work, run the app and look at it yourself with whatever your
    harness offers; use `multiagents shot` to capture states for yourself and the fixer.
    - Accept: `multiagents accept T00N`; report to the user; next task.

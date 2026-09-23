@@ -29,13 +29,15 @@ sessions the bundled binary is found automatically).
 
 ## Running
 
-**`another worker is running in this repo (…, pid N)`**
-One worker per repo. Wait, or if the pid is truly dead and the message persists, delete
-`.multiagents/worker.lock` (a garbage/empty lock is treated as stale automatically).
+**`a worker is already running on T00N`**
+One worker per task. Wait, or if the pid is truly dead and the message persists, delete
+`.multiagents/tasks/T00N-*/worker.lock` (a garbage/empty lock is treated as stale
+automatically). Different tasks run in parallel — this lock is per task.
 
-**`working tree has uncommitted changes`**
-First run of a task snapshots a base commit; commit/stash first, or pass `--allow-dirty`
-knowing the diff-vs-base will include your changes.
+**`uncommitted changes` complaints**
+`accept` needs the MAIN tree clean (it merges there) and refuses if the task's worktree has
+uncommitted work. Starting a task never requires a clean tree — but the worker starts from the
+last commit, so commit anything the task must build on.
 
 **`HEAD is detached … check out a named branch`**
 `accept`/`reject` need to know where to merge back. `git switch <branch>` first.
@@ -52,6 +54,18 @@ suites, or split the task.
 **`outcome: error during execution` with `api_error` in the log**
 Provider-side failures; the log's `[retry]` lines show attempts. Off-peak DeepSeek and busy
 Fireworks hours can be slow; re-running the role resumes nothing but costs little.
+
+**`merging ma/T00N into <base> conflicts`** on accept
+Another accepted task changed the same lines. Run `multiagents sync T00N` (merges the base into
+the task's worktree), resolve there — yourself, or a fixer round whose feedback says to resolve
+the merge — commit, and accept again. The main tree is never left conflicted.
+
+**`worktree missing`** / worktree folder deleted by hand
+The next `run` on that task re-creates it from the task branch (`git worktree prune` +
+re-add happen automatically). Stray registrations clean up with `git worktree prune`.
+
+**`the main tree is on '<branch>'`** on accept
+`accept` merges into the task's recorded base branch; `git switch <base>` and re-run.
 
 **Round shows `interrupted`**
 The CLI was killed (Ctrl-C, app quit). Nothing is corrupted: the branch keeps whatever was

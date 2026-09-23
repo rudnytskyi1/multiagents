@@ -49,8 +49,8 @@ description: Set up or check the multiagents team. Covers providers (Fireworks /
 
 6. **Project settings (optional).** A repo's `.claude/multiagents.json` may set only:
    `provider`, `models`, `aliases`, `prices`, `allow`, `deny`, `permission_mode` (not
-   bypassPermissions), `max_turns`, `timeout_minutes`, `idle_timeout_minutes`, `use_branches`,
-   `branch_prefix`. Anything else (endpoints, key sources, binaries, worker env) is ignored from
+   bypassPermissions), `max_turns`, `timeout_minutes`, `idle_timeout_minutes`, `use_branches`, `worktrees`,
+   `worktree_link`, `branch_prefix`. Anything else (endpoints, key sources, binaries, worker env) is ignored from
    project files by design — it belongs in `~/.multiagents/config.json`. Propose additions to
    `"allow"` when a worker's summary shows denied commands the project genuinely needs, and show
    the user before writing:

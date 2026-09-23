@@ -43,7 +43,8 @@ model walk through it.
 
 ## 4. First task
 
-Open a session in a **git repo on a named branch with a clean tree**, pick your strongest
+Open a session in a **git repo on a named branch** (uncommitted changes are fine — workers
+run in their own worktrees from the last commit and never touch your tree), pick your strongest
 model as the lead, and type:
 
 ```

@@ -123,7 +123,9 @@ multiagents shot T00N <name> --url URL [--width W --height H] [--dark]
                                        screenshot a page (headless Chrome) into the task's shots/
 multiagents shot T00N <name> --ios     screenshot the booted iOS Simulator into shots/
 multiagents status [T00N]              rounds, verdicts, time, estimated cost
-multiagents diff T00N [--stat] [-- p]  changes vs the task's base commit
+multiagents digest T00N                compact review packet (verdicts + key sections + stat)
+multiagents sync T00N                  merge the base branch into a parallel task's worktree
+multiagents diff T00N [--stat|--last]  changes vs base; --last = last round only
 multiagents accept T00N [--squash]     merge the task branch into its base branch
 multiagents reject T00N                abandon (the branch is kept)
 multiagents selftest                   re-run the credential leak self-test
@@ -156,7 +158,7 @@ Merge order (later wins): built-in defaults → the selected provider's block �
 - **Trust boundary:** a repo's `.claude/multiagents.json` is untrusted input, so only these keys
   are honored from it: `provider`, `models`, `aliases`, `prices`, `allow`, `deny`,
   `permission_mode` (not bypassPermissions), `max_turns`, `timeout_minutes`,
-  `idle_timeout_minutes`, `use_branches`, `branch_prefix`. Endpoints, key sources, the claude
+  `idle_timeout_minutes`, `use_branches`, `worktrees`, `branch_prefix`. Endpoints, key sources, the claude
   binary, worker home and worker env can only be set in `~/.multiagents/config.json` — a cloned
   repo must not be able to redirect your keys or run its own binary.
 - **Models:** per role via config, `MULTIAGENTS_<ROLE>_MODEL`, or `--model` per run.
@@ -185,7 +187,8 @@ send the **subscription OAuth token** to the custom `ANTHROPIC_BASE_URL`, even w
    key), a worker is pointed at a local capture server with a canary key; if an Anthropic
    credential pattern shows up in any header or the body, or the canary is missing, workers
    refuse to run.
-4. **Untrusted project config** (see the trust boundary above), a per-repo worker lock,
+4. **Untrusted project config** (see the trust boundary above), a per-task worker lock
+   (repo-wide in legacy non-worktree mode),
    read-denies on credential paths (`~/.claude`, `~/.ssh`, `~/.aws`, …), and no MCP servers or
    telemetry in workers.
 
@@ -216,11 +219,12 @@ edge case baked into the spec itself.
 
 ## Limitations
 
-- One worker per repository at a time (workers share the working tree; the lock enforces it).
+- Independent tasks run in parallel (each in its own git worktree); within one task, one
+  worker at a time.
 - Workers can't see your conversation — everything must be in the spec or feedback. This is
   deliberate: it keeps specs honest.
 - Start tasks from a named branch (detached HEAD is refused so accept/reject know where to
-  merge).
+  merge); `accept` wants the main tree clean and on the base branch.
 - macOS, Linux, and Windows (via Claude Code's Git Bash; no Developer Mode needed — symlinks
   fall back to junctions/copies). `shot --ios` needs macOS + Xcode tools.
 - Claude Code reports costs at Anthropic prices for unknown models; multiagents ignores that and

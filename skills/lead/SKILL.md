@@ -38,15 +38,24 @@ Commit your own changes separately as `[T00N] lead: <summary>`.
 | `multiagents shot T00N <name> --url <url> [--width 360 --height 740] [--dark]` | Saves a headless-Chrome screenshot of a web page into the task's `shots/` folder. |
 | `multiagents shot T00N <name> --ios` | Saves a screenshot of the booted iOS Simulator into the task's `shots/` folder. |
 | `multiagents status [T00N]` | Lists tasks, rounds, worker verdicts, time and cost. |
-| `multiagents diff T00N [--stat] [paths…]` | Shows the task's changes vs its base commit. |
+| `multiagents digest T00N` | Zero-cost review packet: verdicts, key report sections, diff stat. Read this before opening full reports. |
+| `multiagents diff T00N [--stat] [--last] [paths…]` | Changes vs base; `--last` = only the most recent round's commits (use after a fix round). |
+| `multiagents sync T00N` | Merges the base branch into a parallel task's worktree. |
 | `multiagents accept T00N [--squash]` | Merges the task branch into its base branch. |
 | `multiagents reject T00N` | Abandons the task and keeps its branch. |
 
 **Always start `multiagents run …` with the Bash tool's `run_in_background: true`.** A run takes
 minutes. You are notified when it ends, so don't poll or sleep. When it finishes, it prints a
-compact summary and the worker's report: outcome, the worker's own status, tokens, estimated cost,
-git changes, and denied commands. While a worker runs you can prepare the next spec or talk with
-the user. Only one worker runs per repository at a time.
+compact summary plus the report **digest** (verdict + problems/risks/notes); the full report
+stays on disk for when the digest signals something.
+
+**Parallel tasks.** Each task works in its own git worktree on its own branch, so the user's
+working tree is never touched and **independent tasks may run at the same time** — dispatch
+several `run` commands in background. Rules: one worker per task at a time; never parallelize
+tasks that will touch the same files (their merges will conflict); accept finished tasks one by
+one, and for a long-lived task that outlived other accepts, run `multiagents sync T00N` to merge
+the base branch into it (conflicts stay in its worktree — resolve via a fixer round whose
+feedback says to resolve the merge, or yourself).
 
 Never print, echo, or ask for API keys. If setup is broken, use `/multiagents:setup`.
 
@@ -83,9 +92,13 @@ specs are the cheapest way to get good code. Include:
 List the relevant **review agents** from `.claude/agents/` and `~/.claude/agents/`, for example
 `spec-compliance-reviewer`. Check once with `ls .claude/agents ~/.claude/agents 2>/dev/null || true`.
 
-**Git:** the first run of a task creates branch `ma/T00N-<slug>` from the current branch, and it
-needs a clean working tree. If the tree is dirty, ask the user whether to commit or stash first.
-Never do that silently.
+**Git:** the first run of a task creates branch `ma/T00N-<slug>` and its own worktree from the
+current branch's HEAD, so the user's working tree is untouched (dirty is fine — but the worker
+starts from the last COMMIT, not from uncommitted changes). A worktree is a CLEAN checkout:
+git-ignored build state (node_modules, .venv, Pods, .env…) is not there — put the bootstrap
+command (`npm ci`, `pod install`…) into the spec's Verification, or list shareable paths in
+`"worktree_link"` in `.claude/multiagents.json`. Project review agents reach workers only if
+`.claude/agents` is committed. `accept` needs the main tree clean and on the base branch.
 
 ### 4. Implement
 Run `multiagents run coder T00N` in the background.
@@ -100,12 +113,30 @@ Run `multiagents run reviewer T00N` in the background. The reviewer runs the bui
 the review agents, then fixes the problems it finds.
 
 ### 6. Your review
-This is your core job. Be rigorous, and economical with tokens.
+This is your core job. Be rigorous where it matters and cheap everywhere else: **your reading
+is the expensive part of this whole system**, and the reviewer has already re-run the build,
+the tests and the review agents.
 
-1. Read the review report, and the coder report only where you need it. Treat both as claims.
-2. Run `multiagents diff T00N --stat`, then read the important hunks with
-   `multiagents diff T00N -- <path>`. Focus on logic, data flow, error handling and API contracts.
-   Skip the boilerplate.
+Pick the tier first:
+
+- **Green path** — the project has real tests for this area, the reviewer's verdict is
+  PASS/PASS_WITH_NOTES, and the review agents found nothing open. Then do NOT re-read the diff
+  line by line: read the run digest (already printed; or `multiagents digest T00N`), the
+  `--stat`, and open only the hunks where the code can be wrong in ways tests don't catch —
+  auth/permissions, money, data migrations/deletion, concurrency, API contracts, anything the
+  reviewer flagged. Aim to read well under a quarter of the diff. Don't open the coder's
+  full report when the reviewer PASSed — the digest already carries its Decisions &
+  assumptions, which is the one part nobody else double-checks; read that part.
+- **Full read** — any of: verdict FAIL/PARTIAL/BLOCKED, the area has no tests, the change
+  touches security- or data-critical code, a worker did something surprising, or a fixer failed
+  the same point twice. Then read the diff properly (`multiagents diff T00N -- <path>` per
+  file) and whatever reports you need.
+- After a **fixer round**, review only `multiagents diff T00N --last` plus the digest — not
+  the whole task diff again. `--last` refuses (rather than lies) when the last round committed
+  nothing; a round that left files uncommitted shows up in its summary and in `digest`.
+
+Regardless of tier: focus on logic, data flow, error handling and API contracts; skip
+boilerplate.
 3. **Visual / UI review** for anything user-facing. Build and run the app and look at it yourself:
    - **iOS:** use the iOS Simulator tool (build, launch, screenshot, inspect). Go to the changed
      screens and check them in light and dark mode, on a small device, with long text, and in
@@ -133,6 +164,8 @@ and the worker cost (from `multiagents status T00N`). At the end, summarize ever
 anything the user should check themselves.
 
 ## Keep your context lean
+- Digest first, always: the run summary and `multiagents digest` carry the verdicts and every
+  flagged problem. Open full reports and full diffs only when the digest gives you a reason.
 - Never `cat` the `.jsonl` transcripts. Read reports and `--stat` output first, and targeted diff
   hunks second.
 - To diagnose a worker, grep or tail `.multiagents/tasks/T00N-…/NN-<role>.log`.

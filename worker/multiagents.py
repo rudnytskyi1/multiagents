@@ -37,7 +37,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 ROOT = Path(__file__).resolve().parent.parent
 PROMPTS = ROOT / "worker" / "prompts"
 TEMPLATES = ROOT / "worker" / "templates"
@@ -90,6 +90,7 @@ DEFAULT_CONFIG = {
     "timeout_minutes": 60,
     "idle_timeout_minutes": 15,
     "use_branches": True,
+    "worktrees": True,  # each task works in its own git worktree, so tasks run in parallel
     "branch_prefix": "ma/",
     "worker_env": {},
 }
@@ -99,7 +100,8 @@ DEFAULT_CONFIG = {
 # user-level ~/.multiagents/config.json.
 PROJECT_SAFE_KEYS = {
     "provider", "models", "aliases", "prices", "allow", "deny", "permission_mode",
-    "max_turns", "timeout_minutes", "idle_timeout_minutes", "use_branches", "branch_prefix",
+    "max_turns", "timeout_minutes", "idle_timeout_minutes", "use_branches", "worktrees",
+    "branch_prefix",
 }
 
 # Tools a worker may run without a prompt (anything else is denied in headless mode and
@@ -267,13 +269,21 @@ def git(repo: Path, *args: str, check: bool = True) -> str:
 
 
 def repo_root() -> Path:
+    """The MAIN repository root — also when invoked from inside a task worktree, whose own
+    toplevel would otherwise hide .multiagents/ and every task."""
     try:
-        r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        r = subprocess.run(["git", "rev-parse", "--show-toplevel", "--git-common-dir"],
+                           capture_output=True, text=True)
     except FileNotFoundError:
         die("git not found on PATH (multiagents requires git)")
     if r.returncode != 0:
         die("not inside a git repository (workers need git to track and review their changes)")
-    return Path(r.stdout.strip())
+    toplevel, common = (r.stdout.splitlines() + ["", ""])[:2]
+    common_path = Path(common) if os.path.isabs(common) else Path.cwd() / common
+    common_path = common_path.resolve()
+    if common_path.name == ".git":
+        return common_path.parent
+    return Path(toplevel)
 
 
 def load_config(repo: Path | None) -> dict:
@@ -684,33 +694,78 @@ def current_branch(repo: Path) -> str:
             or git(repo, "symbolic-ref", "--short", "-q", "HEAD", check=False))
 
 
-def prepare_git(cfg: dict, task: Task, role: str, allow_dirty: bool) -> None:
+def provision_worktree(cfg: dict, repo: Path, wt: Path) -> None:
+    """A worktree is a clean checkout: git-ignored build state (node_modules, .env, Pods...)
+    is not in it. Link the paths the project lists in "worktree_link" from the main tree so
+    workers can build without re-bootstrapping. Paths are shared, not copied — parallel tasks
+    share e.g. one node_modules; list only what tolerates that."""
+    for rel in cfg.get("worktree_link") or []:
+        rel = str(rel).strip().lstrip("/")
+        if not rel or ".." in rel.split("/"):
+            continue
+        src, dst = repo / rel, wt / rel
+        if src.exists() and not dst.exists() and not dst.is_symlink():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                _mirror(src, dst)
+            except OSError as e:
+                print(f"note: could not link {rel} into the worktree ({e})", file=sys.stderr)
+
+
+def prepare_git(cfg: dict, task: Task, role: str, allow_dirty: bool) -> Path:
+    """Set up the place the worker will run in, and return that directory.
+
+    Default (worktrees on): each task gets its own git worktree under
+    .multiagents/worktrees/, on its own ma/ branch — tasks run in parallel and the user's
+    own working tree is never touched. Legacy modes (worktrees/use_branches off) run in
+    the main tree as before."""
     repo, m = task.repo, task.meta
-    current = current_branch(repo)
     if role == "scout" and not m.get("base_commit"):
-        return  # read-only research: no branch needed
+        return repo  # read-only research: runs on whatever the main tree has checked out
     if not m.get("base_commit"):
+        current = current_branch(repo)
         if not current:
             die("HEAD is detached (or git is too old for --show-current); check out a named branch "
                 "before starting a task, so accept/reject know where to merge back")
-        dirty = dirty_files(repo)
-        if dirty and not allow_dirty:
-            die("working tree has uncommitted changes; commit or stash them before the first run of a task "
-                "(or pass --allow-dirty):\n  " + "\n  ".join(dirty[:15]))
         m["base_commit"] = git(repo, "rev-parse", "HEAD")
         m["base_branch"] = current
-        if cfg["use_branches"]:
-            branch = cfg["branch_prefix"] + task.dir.name
+        branch = cfg["branch_prefix"] + task.dir.name
+        if cfg["use_branches"] and cfg.get("worktrees", True):
+            wt = team_dir(repo) / "worktrees" / task.dir.name
+            wt.parent.mkdir(exist_ok=True)
+            git(repo, "worktree", "add", "-b", branch, str(wt), m["base_commit"])
+            m["branch"], m["worktree"] = branch, str(wt)
+        elif cfg["use_branches"]:
+            dirty = dirty_files(repo)
+            if dirty and not allow_dirty:
+                die("working tree has uncommitted changes; commit or stash them before the first run "
+                    "of a task (or pass --allow-dirty):\n  " + "\n  ".join(dirty[:15]))
             git(repo, "checkout", "-b", branch)
             m["branch"] = branch
         else:
             m["branch"] = current
         task.save()
-    elif m.get("branch") and current != m["branch"]:
+        return Path(m["worktree"]) if m.get("worktree") else repo
+
+    if m.get("worktree"):
+        wt = Path(m["worktree"])
+        expected = team_dir(repo) / "worktrees" / task.dir.name
+        if not wt.exists() and wt != expected:
+            wt = expected  # the repo (or its path) moved; re-home under the current location
+            m["worktree"] = str(wt)
+            task.save()
+        if not wt.exists():  # removed by accept/reject/hand or `git worktree prune`
+            git(repo, "worktree", "prune")
+            wt.parent.mkdir(parents=True, exist_ok=True)
+            git(repo, "worktree", "add", str(wt), m["branch"])
+        return wt
+    current = current_branch(repo)
+    if m.get("branch") and current != m["branch"]:
         if dirty_files(repo):
             die(f"on branch {current} with uncommitted changes; the task lives on {m['branch']}. "
                 "Commit or stash first, then re-run.")
         git(repo, "checkout", m["branch"])
+    return repo
 
 
 # ----------------------------------------------------------------------------- run a worker
@@ -729,9 +784,10 @@ def read_report(task: Task, rnd: dict | None) -> str:
     return p.read_text() if p.exists() else ""
 
 
-def build_prompts(task: Task, role: str, n: int, report_rel: str, feedback: Path | None,
-                  resuming: bool) -> tuple[str, str]:
+def build_prompts(task: Task, role: str, n: int, report: Path, feedback: Path | None,
+                  resuming: bool, workdir: Path) -> tuple[str, str]:
     m = task.meta
+    report_ref = str(report)  # absolute: in worktree mode the task dir is outside the cwd
     # The fixer's "round" is the FEEDBACK round (matching feedback-N.md), not the global
     # worker-round index, so its commits and report line up with the feedback file.
     round_no = n
@@ -742,20 +798,24 @@ def build_prompts(task: Task, role: str, n: int, report_rel: str, feedback: Path
                      "create, add or commit any file; editing tools are disabled and git write "
                      "commands are denied.")
         report_rules = (f"Your final message IS the report: end with the full report text "
-                        f"(nothing else after it). It is saved to `{report_rel}` automatically.")
+                        f"(nothing else after it). It is saved to `{report_ref}` automatically.")
     else:
-        git_rules = ("You are on branch `{branch}`. When done, commit only the files you changed: "
+        where = ("You are working in a dedicated git worktree of the user's repository; branch "
+                 "`{branch}` is already checked out for you. " if m.get("worktree") else
+                 "You are on branch `{branch}`. ")
+        git_rules = (where +
+                     "When done, commit only the files you changed: "
                      "`git add <paths>` then `git commit -m \"[{tid}] <role>: <summary>\"`. Never push, "
                      "switch branches, checkout, merge, rebase, reset, stash, clean, or rewrite history. "
                      "To discard your own change to a file, use `git restore <path>`."
                      ).format(branch=m.get("branch", ""), tid=m["id"])
-        report_rules = f"Writing it is your last step: use the Write tool to create `{report_rel}`."
+        report_rules = f"Writing it is your last step: use the Write tool to create `{report_ref}`."
     vals = {
         "task_id": m["id"], "title": m.get("title", ""),
         "branch": m.get("branch") or "(none — read-only task on the current branch)",
         "base_commit": m.get("base_commit", "")[:12] or "(none)",
-        "report_path": report_rel, "round": str(round_no),
-        "repo": str(task.repo), "task_dir": task.rel(task.dir),
+        "report_path": report_ref, "round": str(round_no),
+        "repo": str(workdir), "task_dir": str(task.dir),
         "git_rules": git_rules, "report_rules": report_rules,
     }
     system = render((PROMPTS / "common.md").read_text(), **vals) + "\n\n" + render((PROMPTS / f"{role}.md").read_text(), **vals)
@@ -775,11 +835,11 @@ def build_prompts(task: Task, role: str, n: int, report_rel: str, feedback: Path
         if review and (not resuming or review["n"] > impl_round["n"]):
             parts.append("# Reviewer report (the reviewer may have changed code after your last turn; "
                          f"re-read files before editing)\n\n{read_report(task, review)}")
-        parts.append(f"# Lead feedback ({task.rel(feedback)})\n\n{feedback.read_text()}")
+        parts.append(f"# Lead feedback ({feedback})\n\n{feedback.read_text()}")
         shots = sorted((task.dir / "shots").glob("*")) if (task.dir / "shots").is_dir() else []
         if shots:
             parts.append("Screenshots from the lead (open them with the Read tool to see them):\n" +
-                         "\n".join(f"- {task.rel(s)}" for s in shots))
+                         "\n".join(f"- {s}" for s in shots))
     else:
         parts.append(f"# Task spec ({m['id']})\n\n{spec}")
         if role == "reviewer":
@@ -791,8 +851,54 @@ def build_prompts(task: Task, role: str, n: int, report_rel: str, feedback: Path
         parts.append("When you are done, end with the full report as your final message — "
                      "it is captured automatically. Do not try to write any file.")
     else:
-        parts.append(f"When you are done, write your report to `{report_rel}` (your last step).")
+        parts.append(f"When you are done, write your report to `{report_ref}` (your last step).")
     return system, "\n\n---\n\n".join(parts)
+
+
+# Report sections that carry decisions the lead must see. Everything else (summary,
+# per-requirement tables, file lists) is re-derivable or already verified by the reviewer,
+# so the lead reads it only on demand — that is where most lead tokens used to go.
+DIGEST_SECTIONS = re.compile(
+    r"^#{2,6}\s*(problems|risks|notes|questions|disagreements|blocked|open questions|"
+    r"feedback points|review agents|verification|checks run|decisions|assumptions|"
+    r"other changes|fixes applied)", re.I)
+
+
+def report_digest(text: str, max_lines: int = 70) -> str:
+    """The verdict line plus only the decision-relevant sections of a worker report.
+    Subheadings (###...) inside a kept section stay inside it."""
+    lines = text.splitlines()
+    out, keep_level = [], None
+    for ln in lines:
+        if re.match(r"^\s*(?:\*\*)?(status|verdict)(?:\*\*)?\s*:", ln, re.I):
+            out.append(ln.strip())
+            continue
+        h = re.match(r"^(#{2,6})\s", ln)
+        if h and (keep_level is None or len(h.group(1)) <= keep_level):
+            keep_level = len(h.group(1)) if DIGEST_SECTIONS.match(ln) else None
+        if keep_level is not None:
+            out.append(ln)
+    while out and not out[-1].strip():
+        out.pop()
+    # A digest that kept (almost) nothing means the report used free-form headings —
+    # show the report instead of a misleading one-liner.
+    if sum(1 for ln in out if ln.strip()) < 4:
+        body = lines[:max_lines]
+        tail = f"\n... (+{len(lines) - max_lines} more lines)" if len(lines) > max_lines else ""
+        return "\n".join(body) + tail
+    if len(out) > max_lines:
+        out = out[:max_lines] + [f"... (+{len(out) - max_lines} more digest lines)"]
+    return "\n".join(out)
+
+
+def report_view(role: str, outcome: str, text: str) -> str:
+    """What to show the lead for one round: the full (capped) report for scouts — their
+    answers ARE the deliverable — and for failed rounds; the digest otherwise."""
+    if role == "scout" or outcome != "success":
+        lines = text.splitlines()
+        tail = f"\n... (+{len(lines) - 150} more lines)" if len(lines) > 150 else ""
+        return "\n".join(lines[:150]) + tail if lines else "(empty)"
+    return report_digest(text) if text else "(empty)"
 
 
 def summarize_tool(name: str, inp: dict, repo: Path) -> str:
@@ -846,32 +952,90 @@ def cmd_run(args) -> int:
     source, helper = key_source(cfg)
     if not helper:
         die(no_key_help(cfg))
-    lock = acquire_lock(repo, task.id, role)
+    lock = acquire_lock(task, role, exclusive_repo=runs_inline(cfg, task.meta, role))
     try:
         ensure_selftest(cfg, binary)
-        prepare_git(cfg, task, role, args.allow_dirty)
-        return _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback)
+        workdir = prepare_git(cfg, task, role, args.allow_dirty)
+        return _run_worker(args, cfg, repo, workdir, task, role, model, binary, helper, feedback)
     finally:
         lock.unlink(missing_ok=True)
 
 
-def lock_holder(repo: Path) -> dict | None:
-    """Return the live worker holding this repo's lock, or None (stale locks don't count).
-    A pid we may not signal (PermissionError) was recycled by another user's process —
-    all real workers run as the invoking user — so it is stale too."""
-    lock = team_dir(repo) / "worker.lock"
+def _pid_alive(pid: int) -> bool:
+    """Liveness probe. NEVER use os.kill(pid, 0) on Windows — CPython maps any non-console
+    signal (including 0) to TerminateProcess, i.e. it would KILL the probed worker."""
+    if IS_WINDOWS:
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE = 0x1000, 259
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            return bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
     try:
-        held = json.loads(lock.read_text())  # a zero-byte/garbage lock is stale, not fatal
-        os.kill(held["pid"], 0)
-        return held
-    except (OSError, json.JSONDecodeError, ProcessLookupError, PermissionError, KeyError, TypeError):
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Recycled by another user's process — all real workers run as the invoking user.
+        return False
+
+
+def _live_lock(lock: Path) -> dict | None:
+    """The live worker holding this lock file, or None (stale/garbage locks don't count)."""
+    try:
+        held = json.loads(lock.read_text())
+        return held if _pid_alive(held["pid"]) else None
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
 
 
-def acquire_lock(repo: Path, task_id: str, role: str) -> Path:
-    """Workers share the working tree, so only one may run per repository at a time."""
-    lock = team_dir(repo) / "worker.lock"
-    payload = json.dumps({"pid": os.getpid(), "task": task_id, "role": role, "started": now_iso()})
+def task_lock_holder(task: Task) -> dict | None:
+    return _live_lock(task.dir / "worker.lock")
+
+
+def live_workers(repo: Path) -> list:
+    """All live workers in this repo (any task), plus the legacy repo-wide lock if held."""
+    held = []
+    for t in all_tasks(repo):
+        h = task_lock_holder(t)
+        if h:
+            held.append(h)
+    legacy = _live_lock(team_dir(repo) / "worker.lock")
+    if legacy:
+        held.append(legacy)
+    return held
+
+
+def runs_inline(cfg: dict, m: dict, role: str) -> bool:
+    """True when this round will run in the MAIN working tree (and so needs the repo-exclusive
+    lock): a pre-worktree task, or worktrees/branches turned off. Mirrors prepare_git."""
+    if role == "scout":
+        return False
+    if m.get("worktree"):
+        return False
+    if m.get("base_commit"):
+        return True  # started under the legacy flow: it lives on a branch in the main tree
+    return not (cfg["use_branches"] and cfg.get("worktrees", True))
+
+
+def acquire_lock(task: Task, role: str, exclusive_repo: bool) -> Path:
+    """One worker per task, always (they share the task's worktree). In legacy inline mode
+    (exclusive_repo=True) workers also share the MAIN working tree, so only one may run in
+    the whole repo."""
+    if exclusive_repo:
+        others = [h for h in live_workers(task.repo) if h.get("task") != task.id]
+        if others:
+            h = others[0]
+            die(f"another worker is running in this repo ({h.get('role')} on {h.get('task')}, "
+                f"pid {h.get('pid')}); without worktrees only one worker may run at a time")
+    lock = task.dir / "worker.lock"
+    payload = json.dumps({"pid": os.getpid(), "task": task.id, "role": role, "started": now_iso()})
     for attempt in (1, 2):
         try:
             fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -879,17 +1043,17 @@ def acquire_lock(repo: Path, task_id: str, role: str) -> Path:
                 f.write(payload)
             return lock
         except FileExistsError:
-            held = lock_holder(repo)
+            held = _live_lock(lock)
             if held:
-                die(f"another worker is running in this repo ({held.get('role')} on {held.get('task')}, "
-                    f"pid {held.get('pid')}); wait for it to finish")
+                die(f"a worker is already running on {task.id} ({held.get('role')}, pid {held.get('pid')}); "
+                    "wait for it to finish")
             if attempt == 1:
                 lock.unlink(missing_ok=True)  # stale: remove and retry once
     die("could not acquire the worker lock (raced with another process); try again")
     return lock  # unreachable
 
 
-def _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback) -> int:
+def _run_worker(args, cfg, repo, workdir, task, role, model, binary, helper, feedback) -> int:
     rounds = task.meta.setdefault("rounds", [])
     n = len(rounds) + 1
     tag = f"{n:02d}-{role}"
@@ -901,12 +1065,16 @@ def _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback) ->
         prev = latest_round(task, ("coder", "fixer"))
         if prev and prev.get("session_id") and prev.get("model") == model:
             resume_id = prev["session_id"]
-    system, prompt = build_prompts(task, role, n, task.rel(report), feedback, resuming=bool(resume_id))
+    system, prompt = build_prompts(task, role, n, report, feedback, resuming=bool(resume_id),
+                                   workdir=workdir)
 
     mode = args.permission_mode or cfg["permission_mode"]
     max_turns = args.max_turns or cfg["max_turns"].get(role)
     cmd = [binary, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode,
            "--settings", json.dumps(worker_settings(cfg, helper, role)), "--strict-mcp-config",
+           # The task dir holds the spec, feedback, screenshots and the report the worker
+           # writes; in worktree mode it sits outside the worker's cwd.
+           "--add-dir", str(task.dir),
            "--append-system-prompt", system]
     if max_turns:
         cmd += ["--max-turns", str(max_turns)]
@@ -921,7 +1089,7 @@ def _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback) ->
         cmd += ["--resume", resume_id]
     env = worker_env(cfg, model, worker_home(cfg), cfg["base_url"])
 
-    head_before = git(repo, "rev-parse", "HEAD")
+    head_before = git(workdir, "rev-parse", "HEAD")
     rnd = {"n": n, "role": role, "model": model, "started": now_iso(), "report": task.rel(report),
            "log": task.rel(log_path), "head_before": head_before, "resumed": bool(resume_id),
            "feedback": str(feedback) if feedback else None}
@@ -957,7 +1125,7 @@ def _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback) ->
 
     logline(f"{role} on {short_model(model)} for {task.id}{' (resumed session)' if resume_id else ''}")
     try:
-        proc = subprocess.Popen(cmd, cwd=repo, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(cmd, cwd=workdir, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, bufsize=1, **POPEN_GROUP_KW)
     except OSError as e:
         finish_round("spawn failed")
@@ -1030,7 +1198,7 @@ def _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback) ->
         elif typ == "assistant":
             for c in ev.get("message", {}).get("content", []):
                 if c.get("type") == "tool_use":
-                    logline(f"{sub}[{c.get('name')}] {summarize_tool(c.get('name', ''), c.get('input') or {}, repo)}")
+                    logline(f"{sub}[{c.get('name')}] {summarize_tool(c.get('name', ''), c.get('input') or {}, workdir)}")
                 elif c.get("type") == "text" and c.get("text", "").strip():
                     logline(f"{sub}[say] " + c["text"].strip().replace("\n", " ")[:300])
         elif typ == "user":
@@ -1073,8 +1241,8 @@ def _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback) ->
         usage["input"] += u.get("inputTokens", 0) + u.get("cacheCreationInputTokens", 0)
         usage["cached"] += u.get("cacheReadInputTokens", 0)
         usage["output"] += u.get("outputTokens", 0)
-    head_after = git(repo, "rev-parse", "HEAD")
-    uncommitted = dirty_files(repo)
+    head_after = git(workdir, "rev-parse", "HEAD")
+    uncommitted = dirty_files(workdir)
     outcome = state["killed"] or res.get("subtype") or f"exit {proc.returncode}"
 
     rnd.update({
@@ -1090,8 +1258,8 @@ def _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback) ->
     task.save()
 
     base = task.meta.get("base_commit")  # scouts never set one
-    stat = (git(repo, "diff", "--shortstat", base, check=False) or "no changes vs base") if base else "n/a (read-only task)"
-    commits = git(repo, "log", "--oneline", f"{head_before}..{head_after}", check=False).splitlines()
+    stat = (git(workdir, "diff", "--shortstat", base, check=False) or "no changes vs base") if base else "n/a (read-only task)"
+    commits = git(workdir, "log", "--oneline", f"{head_before}..{head_after}", check=False).splitlines()
     print(f"== {task.id} · round {n} · {role} · {short_model(model)} ==")
     print(f"outcome: {outcome} · worker status: {worker_status} · {res.get('num_turns', '?')} turns · {fmt_secs(elapsed)}")
     print(f"tokens: in {fmt_tokens(usage['input'])} · cached {fmt_tokens(usage['cached'])} · out {fmt_tokens(usage['output'])}"
@@ -1107,11 +1275,9 @@ def _run_worker(args, cfg, repo, task, role, model, binary, helper, feedback) ->
     if state.get("retries"):
         print(f"API retries: {state['retries']} ({cfg['provider_name']} was slow or flaky for {short_model(model)})")
     print(f"report: {task.rel(report)}   log: {task.rel(log_path)}")
-    print("----- report -----")
-    lines = report_text.splitlines()
-    print("\n".join(lines[:150]) if lines else "(empty)")
-    if len(lines) > 150:
-        print(f"... ({len(lines) - 150} more lines in {task.rel(report)})")
+    label = "report" if role == "scout" or outcome != "success" else f"report digest (full: {task.rel(report)})"
+    print(f"----- {label} -----")
+    print(report_view(role, outcome, report_text))
     return 0 if outcome == "success" else 1
 
 
@@ -1162,10 +1328,10 @@ def cmd_status(args) -> int:
         rounds = m.get("rounds", [])
         spent = sum(r.get("cost_usd") or 0 for r in rounds)
         print(f"{m['id']}  {m.get('status', '?'):<12} {m.get('title', '')}  [{t.rel(t.dir)}]")
-        live = lock_holder(repo)
+        live = task_lock_holder(t)
         for r in rounds if args.task or args.verbose else rounds[-3:]:
             cost = f"${r['cost_usd']:.3f}" if r.get("cost_usd") is not None else "-"
-            outcome = r.get("outcome") or ("running" if live and live.get("task") == m["id"] else "interrupted")
+            outcome = r.get("outcome") or ("running" if live else "interrupted")
             print(f"   {r['n']:>2}. {r['role']:<8} {short_model(r['model']):<24} {outcome:<16} "
                   f"{r.get('worker_status', ''):<16} {fmt_secs(r.get('seconds', 0)):>7} {cost:>8}")
         if rounds:
@@ -1176,15 +1342,91 @@ def cmd_status(args) -> int:
 def cmd_diff(args) -> int:
     repo = repo_root()
     task = find_task(repo, args.task)
-    base = task.meta.get("base_commit")
+    m = task.meta
+    base = m.get("base_commit")
     if not base:
         die(f"{task.id} has not been started yet")
-    current = git(repo, "branch", "--show-current", check=False)
-    target = [] if current == task.meta.get("branch") else [task.meta["branch"]]
     stat = args.stat or "--stat" in args.rest
-    paths = [p for p in args.rest if p not in ("--", "--stat")]
-    r = subprocess.run(["git", "diff", *(["--stat"] if stat else []), base, *target, "--", *paths], cwd=repo)
+    last = args.last or "--last" in args.rest  # REMAINDER swallows flags placed after the task id
+    paths = [p for p in args.rest if p not in ("--", "--stat", "--last")]
+    if last:
+        # Only what the most recent round committed — the cheap re-review after a fix round.
+        rounds = m.get("rounds", [])
+        if not rounds:
+            die(f"{task.id} has no rounds yet")
+        r = rounds[-1]
+        if not r.get("head_after") or r.get("head_before") == r.get("head_after"):
+            extra = f" (it left {r['uncommitted']} file(s) uncommitted in the worktree)" if r.get("uncommitted") else ""
+            die(f"the last round ({r['n']}, {r['role']}) made no commits{extra}; "
+                f"nothing to show with --last")
+        span = [r["head_before"], r["head_after"]]
+    elif m.get("worktree") or current_branch(repo) != m.get("branch"):
+        span = [base, m["branch"]]
+    else:
+        span = [base]
+    wt = Path(m.get("worktree") or "")
+    if m.get("worktree") and wt.exists() and dirty_files(wt):
+        print(f"note: the task worktree has uncommitted changes that this diff does not show "
+              f"({wt})", file=sys.stderr)
+    r = subprocess.run(["git", "diff", *(["--stat"] if stat else []), *span, "--", *paths], cwd=repo)
     return r.returncode
+
+
+def cmd_digest(args) -> int:
+    """Zero-model review packet: verdicts + decision-relevant report sections + diff stat."""
+    repo = repo_root()
+    task = find_task(repo, args.task)
+    m = task.meta
+    rounds = m.get("rounds", [])
+    if not rounds:
+        die(f"{task.id} has no rounds yet")
+    print(f"{m['id']}  {m.get('status')}  {m.get('title', '')}")
+    spent = sum(r.get("cost_usd") or 0 for r in rounds)
+    for r in rounds[-(len(rounds) if args.all else 2):]:
+        print(f"\n=== round {r['n']} · {r['role']} · {r.get('outcome', '?')} · "
+              f"{r.get('worker_status', '')} · {fmt_secs(r.get('seconds', 0))} ===")
+        p = task.repo / r["report"]
+        print(report_view(r["role"], r.get("outcome") or "?", p.read_text()) if p.exists() else "(no report)")
+    if m.get("base_commit"):
+        stat = git(repo, "diff", "--stat", m["base_commit"], m.get("branch") or "HEAD", check=False)
+        print("\n=== diff vs base ===")
+        print("\n".join(stat.splitlines()[-15:]) if stat else "(no changes)")
+        wt = Path(m.get("worktree") or "")
+        if m.get("worktree") and wt.exists():
+            dirty = dirty_files(wt)
+            if dirty:
+                print(f"WARNING: {len(dirty)} uncommitted file(s) in the task worktree are NOT in "
+                      "this diff: " + ", ".join(d[3:] for d in dirty[:8]))
+    print(f"\nworker cost so far: ${spent:.3f}")
+    return 0
+
+
+def _merge_task(repo: Path, task: Task, squash: bool) -> None:
+    m = task.meta
+    if squash:
+        r = subprocess.run(["git", "merge", "--squash", m["branch"]],
+                           cwd=repo, capture_output=True, text=True)
+        if r.returncode != 0:
+            conflicted = git(repo, "diff", "--name-only", "--diff-filter=U", check=False)
+            git(repo, "reset", "--merge", check=False)  # a conflicted squash has no MERGE_HEAD to abort
+            _merge_conflict_die(task, conflicted)
+        git(repo, "commit", "-m", f"{task.id}: {m.get('title', '')}")
+    else:
+        r = subprocess.run(["git", "merge", "--no-ff", m["branch"], "-m",
+                            f"Merge {task.id}: {m.get('title', '')}"],
+                           cwd=repo, capture_output=True, text=True)
+        if r.returncode != 0:
+            conflicted = git(repo, "diff", "--name-only", "--diff-filter=U", check=False)
+            git(repo, "merge", "--abort", check=False)
+            _merge_conflict_die(task, conflicted)
+
+
+def _merge_conflict_die(task: Task, conflicted: str) -> None:
+    m = task.meta
+    die(f"merging {m['branch']} into {m['base_branch']} conflicts"
+        + (f" in:\n  " + "\n  ".join(conflicted.splitlines()[:15]) if conflicted else "")
+        + f"\nRun `multiagents sync {task.id}` to bring {m['base_branch']} into the task "
+          "branch, resolve there (yourself or via a fixer round), then accept again.")
 
 
 def cmd_accept(args) -> int:
@@ -1193,22 +1435,36 @@ def cmd_accept(args) -> int:
     m = task.meta
     if not m.get("base_commit"):
         die(f"{task.id} has no work to accept")
-    held = lock_holder(repo)
+    held = task_lock_holder(task)
     if held:
-        die(f"a worker is running in this repo ({held.get('role')} on {held.get('task')}); "
-            "accepting now would switch branches under it — wait for it to finish")
+        die(f"a worker is still running on {task.id} ({held.get('role')}); wait for it to finish")
     if m.get("branch") and not m.get("base_branch"):
         die(f"{task.id} has no recorded base branch (it was started from a detached HEAD); "
             f"merge {m['branch']} manually")
-    if dirty_files(repo):
-        die("uncommitted changes in the working tree; commit (or discard) them before accepting")
-    if m.get("branch") and m.get("base_branch") and m["branch"] != m["base_branch"]:
+    if m.get("worktree"):
+        wt = Path(m["worktree"])
+        if wt.exists() and dirty_files(wt):
+            die(f"the task worktree has uncommitted changes ({wt}); commit them there or run a "
+                "fixer round before accepting")
+        if current_branch(repo) != m["base_branch"]:
+            die(f"the main tree is on {current_branch(repo) or 'a detached HEAD'!r}; switch to "
+                f"{m['base_branch']} (where {task.id} merges) and re-run accept")
+        if dirty_files(repo):
+            die("uncommitted changes in the main working tree; commit or stash them before accepting")
+        _merge_task(repo, task, args.squash)
+        if wt.exists():
+            git(repo, "worktree", "remove", "--force", str(wt), check=False)
+        # The path is kept in task.json: a later round (fixer after accept, re-open after
+        # reject) re-creates the worktree there instead of falling back to the main tree.
+    elif m.get("branch") and m.get("base_branch") and m["branch"] != m["base_branch"]:
+        held_any = [h for h in live_workers(repo)]
+        if held_any:
+            die("workers are running in this repo; accepting an inline task would switch branches "
+                "under them — wait")
+        if dirty_files(repo):
+            die("uncommitted changes in the working tree; commit (or discard) them before accepting")
         git(repo, "checkout", m["base_branch"])
-        if args.squash:
-            git(repo, "merge", "--squash", m["branch"])
-            git(repo, "commit", "-m", f"{task.id}: {m.get('title', '')}")
-        else:
-            git(repo, "merge", "--no-ff", m["branch"], "-m", f"Merge {task.id}: {m.get('title', '')}")
+        _merge_task(repo, task, args.squash)
     m["status"] = "accepted"
     m["accepted"] = now_iso()
     task.save()
@@ -1220,21 +1476,65 @@ def cmd_reject(args) -> int:
     repo = repo_root()
     task = find_task(repo, args.task)
     m = task.meta
-    held = lock_holder(repo)
+    held = task_lock_holder(task)
     if held:
-        die(f"a worker is running in this repo ({held.get('role')} on {held.get('task')}); "
-            "wait for it to finish before rejecting")
-    if m.get("branch") and m["branch"] != m.get("base_branch") and not m.get("base_branch"):
-        die(f"{task.id} has no recorded base branch; switch branches manually, then re-run reject")
-    if m.get("base_branch") and current_branch(repo) != m["base_branch"]:
+        die(f"a worker is still running on {task.id} ({held.get('role')}); wait before rejecting")
+    if m.get("worktree"):
+        wt = Path(m["worktree"])
+        if wt.exists():
+            dirty = dirty_files(wt)
+            if dirty:
+                # Never destroy work: park it on the task branch so "kept for reference" is true.
+                git(wt, "add", "-A")
+                r = subprocess.run(["git", "commit", "-m", f"[{task.id}] WIP at reject"],
+                                   cwd=wt, capture_output=True, text=True)
+                if r.returncode != 0:
+                    die(f"the worktree has {len(dirty)} uncommitted file(s) and they could not be "
+                        f"committed ({(r.stderr or r.stdout).strip()[:150]}); resolve in {wt} first")
+                print(f"parked {len(dirty)} uncommitted file(s) as a WIP commit on {m['branch']}")
+            git(repo, "worktree", "remove", "--force", str(wt), check=False)
+    elif m.get("base_branch") and current_branch(repo) != m["base_branch"]:
         if dirty_files(repo):
             die("uncommitted changes in the working tree; commit or discard them first")
         git(repo, "checkout", m["base_branch"])
+    elif m.get("branch") and m["branch"] != m.get("base_branch") and not m.get("base_branch"):
+        die(f"{task.id} has no recorded base branch; switch branches manually, then re-run reject")
     m["status"] = "rejected"
     task.save()
     kept = f"; branch {m['branch']} kept for reference" if m.get("branch") and m.get("branch") != m.get("base_branch") else ""
     print(f"{task.id} rejected{kept}")
     return 0
+
+
+def cmd_sync(args) -> int:
+    """Bring the base branch into a task's worktree, so a long-lived parallel task can absorb
+    what was accepted after it started (and merge conflicts get resolved on the task side)."""
+    repo = repo_root()
+    task = find_task(repo, args.task)
+    m = task.meta
+    if not m.get("worktree"):
+        die(f"{task.id} has no worktree (sync is for worktree tasks)")
+    held = task_lock_holder(task)
+    if held:
+        die(f"a worker is running on {task.id}; wait before syncing")
+    wt = Path(m["worktree"])
+    if not wt.exists():
+        die(f"worktree missing at {wt}; run a worker round first (it re-creates it)")
+    if dirty_files(wt):
+        die("the task worktree has uncommitted changes; commit them first")
+    r = subprocess.run(["git", "merge", "--no-edit", m["base_branch"]], cwd=wt,
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"{task.id}: merged {m['base_branch']} into {m['branch']} cleanly")
+        return 0
+    conflicted = git(wt, "diff", "--name-only", "--diff-filter=U", check=False)
+    print(f"{task.id}: merge of {m['base_branch']} left conflicts in:")
+    for f in conflicted.splitlines()[:20]:
+        print(f"  {f}")
+    print("The worktree is left mid-merge. Resolve and `git add` + `git commit` there yourself, "
+          "or dispatch a fixer round whose feedback says to resolve the merge (conflict "
+          "resolution needs only allowed git commands).")
+    return 1
 
 
 def http_json(url: str, key: str, payload: dict | None = None, timeout: int = 60):
@@ -1564,8 +1864,18 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("diff", help="show a task's changes vs its base commit")
     s.add_argument("task")
     s.add_argument("--stat", action="store_true")
+    s.add_argument("--last", action="store_true", help="only the most recent code-changing round")
     s.add_argument("rest", nargs=argparse.REMAINDER, help="[--] paths to limit the diff to")
     s.set_defaults(fn=cmd_diff)
+
+    s = sub.add_parser("digest", help="compact review packet: verdicts, key report sections, diff stat")
+    s.add_argument("task")
+    s.add_argument("--all", action="store_true", help="digest every round, not just the last two")
+    s.set_defaults(fn=cmd_digest)
+
+    s = sub.add_parser("sync", help="merge the base branch into a task's worktree (parallel tasks)")
+    s.add_argument("task")
+    s.set_defaults(fn=cmd_sync)
 
     s = sub.add_parser("accept", help="merge the task branch into its base branch")
     s.add_argument("task")
@@ -1577,7 +1887,7 @@ def main(argv: list[str] | None = None) -> int:
     s.set_defaults(fn=cmd_reject)
 
     args = p.parse_args(argv)
-    if os.environ.get("MULTIAGENTS_WORKER") and args.cmd in ("run", "accept", "reject", "new", "feedback", "shot"):
+    if os.environ.get("MULTIAGENTS_WORKER") and args.cmd in ("run", "accept", "reject", "new", "feedback", "shot", "sync"):
         print(f"multiagents: workers may not run '{args.cmd}' (team commands belong to the lead)", file=sys.stderr)
         return 2
     try:
