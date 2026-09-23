@@ -2,6 +2,11 @@
 
 **Your expensive session leads. Cheap DeepSeek workers do the typing.**
 
+Docs: [getting started](docs/getting-started.md) · [how it works](docs/how-it-works.md) ·
+[configuration](docs/configuration.md) · [CLI](docs/cli.md) · [providers](docs/providers.md) ·
+[security](docs/security.md) · [Codex](docs/codex.md) ·
+[troubleshooting](docs/troubleshooting.md) · [по-русски](README.ru.md)
+
 A plugin for Claude Code (with an OpenAI Codex install too) that turns your interactive session
 into a **team lead**. The lead plans the work, writes precise task specs, reviews the code and
 the running UI, and sends feedback. **Workers** are headless Claude Code processes running

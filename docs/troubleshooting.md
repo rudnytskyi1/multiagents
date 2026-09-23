@@ -1,0 +1,93 @@
+# Troubleshooting
+
+Start with `multiagents doctor` — most problems show up as a FAIL line there. Below, symptom →
+cause → fix.
+
+## Setup
+
+**`api key FAIL — not found`**
+No key for the *active* provider (each has its own). Store it per
+[getting-started.md](getting-started.md#2-store-an-api-key), or check which provider is active
+with `multiagents provider`.
+
+**`endpoint FAIL` / `model FAIL`**
+Wrong key, no access to the model, or the provider is down. `multiagents models --all` shows
+what the key can actually use; put a valid id into `models` ([configuration.md](configuration.md)).
+On DeepSeek remember `deepseek-chat`/`deepseek-reasoner` no longer exist.
+
+**`isolation FAIL`**
+The leak self-test saw an Anthropic credential (or not the canary) in the probe request. Do not
+run workers. Re-try `multiagents selftest` after updating Claude Code; if it keeps failing,
+file an issue with the printed detail — this is the tool doing its job.
+
+**`multiagents: python3 >= 3.9 is required`**
+Install a newer python3 (the wrapper checks before parsing the CLI).
+
+**`claude` not found**
+Install Claude Code's CLI, or set `MULTIAGENTS_CLAUDE_BIN=/path/to/claude` (inside Claude Code
+sessions the bundled binary is found automatically).
+
+## Running
+
+**`another worker is running in this repo (…, pid N)`**
+One worker per repo. Wait, or if the pid is truly dead and the message persists, delete
+`.multiagents/worker.lock` (a garbage/empty lock is treated as stale automatically).
+
+**`working tree has uncommitted changes`**
+First run of a task snapshots a base commit; commit/stash first, or pass `--allow-dirty`
+knowing the diff-vs-base will include your changes.
+
+**`HEAD is detached … check out a named branch`**
+`accept`/`reject` need to know where to merge back. `git switch <branch>` first.
+
+**Run summary shows `denied (add to "allow" …)`**
+The worker needed a command outside the allowlist. If it is safe and project-specific, add it
+to `"allow"` in `.claude/multiagents.json` and re-run the role.
+
+**`outcome: timeout` / `idle timeout`**
+The run hit `timeout_minutes`, or was silent longer than the idle cap (≥ max Bash timeout + 5
+min — a single build cannot trip it, but a hung tool can). Raise `timeout_minutes` for slow
+suites, or split the task.
+
+**`outcome: error during execution` with `api_error` in the log**
+Provider-side failures; the log's `[retry]` lines show attempts. Off-peak DeepSeek and busy
+Fireworks hours can be slow; re-running the role resumes nothing but costs little.
+
+**Round shows `interrupted`**
+The CLI was killed (Ctrl-C, app quit). Nothing is corrupted: the branch keeps whatever was
+committed; run the role again.
+
+**Fixer didn't resume the coder's session**
+Resume only happens when the previous coder/fixer round used the *same model* and recorded a
+session id. `--fresh` forces a new session on purpose.
+
+**Worker "fixed" something outside the task / touched too much**
+That is what `multiagents diff` and the lead review are for: `reject` the task, tighten the
+spec's "Out of scope", and re-run. Branches keep main safe.
+
+## Screenshots
+
+**Blank PNG at `--width < 500`**
+Headless Chrome lays out at ≥ 500px, so narrow shots render the page inside an iframe — pages
+sending `X-Frame-Options`/CSP `frame-ancestors` refuse to render there. Retake at `--width 500+`.
+
+**`no Chrome/Chromium/Edge found`** — install one, or capture with your own tool into the
+task's `shots/` folder (any PNG there is handed to the fixer).
+
+**Image is 500px wide with margins (Linux)** — no `sips`/ImageMagick found for the crop;
+install `imagemagick` or ignore the margins.
+
+## Reading the artifacts
+
+- `NN-<role>.log` — timeline: every tool call, `[error]` tool failures, `[stderr]` from the
+  worker process, `[retry]` API retries. `grep error` it first.
+- `NN-<role>-report.md` — what the worker claims; the lead treats it as a claim.
+- `NN-<role>.jsonl` — full protocol transcript; heavy, last resort.
+- `task.json` — rounds with outcome, tokens, cost, session ids, head commits.
+
+## Resetting
+
+- Worker Claude state: `rm -rf ~/.multiagents/worker-home` (recreated on next run).
+- Self-test cache: `rm ~/.multiagents/selftest.json` or `multiagents selftest`.
+- A task: `multiagents reject T00N`, then delete its folder under `.multiagents/tasks/` and
+  `git branch -D ma/T00N-…` if unwanted.
