@@ -4,14 +4,14 @@
     "name": "rudnytskyi1"
   },
   "metadata": {
-    "description": "Lead/worker team for Claude Code: your Claude session plans and reviews, DeepSeek workers on Fireworks do the coding."
+    "description": "Lead/worker team for Claude Code: your Claude session plans and reviews, DeepSeek workers (Fireworks, Hive or api.deepseek.com) do the coding."
   },
   "plugins": [
     {
       "name": "multiagents",
       "source": "./",
-      "description": "Your Claude session leads (plans, reviews code and UI); DeepSeek workers on Fireworks write, test, and fix the code.",
-      "version": "0.3.0"
+      "description": "Your Claude session leads (plans, reviews code and UI); DeepSeek workers (Fireworks, Hive or api.deepseek.com) write, test, and fix the code.",
+      "version": "0.4.0"
     }
   ]
 }

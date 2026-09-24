@@ -9,8 +9,8 @@ splits the two:
 - The **lead** is your normal interactive session (Claude Code or Codex). It plans, writes task
   specs, reviews diffs and the running UI, and decides. It is told not to write production code.
 - **Workers** are headless Claude Code processes (`claude -p`) whose API traffic goes to a cheap
-  provider (DeepSeek on Fireworks, or api.deepseek.com). They implement, verify, review with your
-  own agents, and fix.
+  provider (DeepSeek on Fireworks, Hive or api.deepseek.com). They implement, verify, review with
+  your own agents, and fix.
 
 The lead never shares a context window with workers. All coordination happens through **files in
 the repo** — specs, reports, feedback — which keeps every hand-off explicit and auditable.
@@ -19,9 +19,11 @@ the repo** — specs, reports, feedback — which keeps every hand-off explicit 
 
 ```
 skills/lead/SKILL.md        the lead protocol (loaded by /multiagents:lead in Claude Code)
-codex/skills/…/SKILL.md     the same protocol for Codex ($multiagents-lead)
+codex/skills/…/SKILL.md     the same protocol for Codex ($multiagents:lead, $multiagents:setup)
+.codex-plugin/, .agents/    the Codex plugin manifest and marketplace (see codex.md)
 bin/multiagents             sh wrapper (python3 >= 3.9 guard)
 worker/multiagents.py       the whole CLI: task store, git, worker spawning, isolation
+worker/openai_bridge.py     Anthropic -> OpenAI translation bridge for "api": "openai" providers (Hive)
 worker/prompts/*.md         system prompts for the roles (common + coder/reviewer/fixer/scout)
 worker/templates/*.md       task.md and feedback-N.md skeletons
 ```
@@ -37,6 +39,7 @@ task.json              bookkeeping: id, title, status, base commit/branch, round
 NN-<role>-report.md    the worker's report for round NN
 NN-<role>.log          human-readable timeline (tool calls, errors, retries)
 NN-<role>.jsonl        raw stream-json transcript (for deep debugging)
+NN-<role>-bridge.log   OpenAI-API providers only: one line per API call through the bridge
 feedback-N.md          the lead's review feedback for fix round N
 shots/*.png            screenshots attached to feedback (fixer models can see them)
 ```
@@ -52,7 +55,8 @@ accepted | rejected`, with `error` whenever a round ends in anything but success
   `.multiagents/worktrees/T00N-<slug>/` on its own branch `ma/T00N-<slug>`. The user's main
   tree is never switched and may stay dirty; the worker starts from the last commit. A
   worktree is a clean checkout: git-ignored state (node_modules, .venv, Pods, .env) is absent —
-  bootstrap in the spec's Verification, or share paths via `"worktree_link"`.
+  bootstrap in the spec's Verification, or share paths via `"worktree_link"` (linked, not
+  copied, when the worktree is created).
 - **Independent tasks run in parallel**: each has its own worktree, so workers cannot touch
   each other's files. One worker per task at a time (`<task dir>/worker.lock`, atomic and
   stale-tolerant).

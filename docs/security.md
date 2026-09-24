@@ -67,6 +67,25 @@ produce a loud warning. `bypassPermissions` cannot be set from a project file. W
 config, endpoint/key plumbing is only accepted inside `providers.<name>`, so switching providers
 can never mix vendor A's key with vendor B's endpoint.
 
+## Layer 5 — the OpenAI bridge keeps the key out of the worker
+
+For providers that only speak the OpenAI API (`"api": "openai"`, e.g. `hive`), the worker never
+receives the provider key at all, not even through `apiKeyHelper`:
+
+- the CLI reads the key and hands it to a translation bridge running **inside the CLI process**,
+  listening on `127.0.0.1` only, for the length of one run;
+- the worker's `ANTHROPIC_BASE_URL` points at the bridge and its `apiKeyHelper` prints a
+  **random one-run token** (from a 0600 file under `~/.multiagents/run/`, deleted when the run
+  ends; workers are denied reading that folder anyway);
+- the bridge checks the token (constant-time compare) and builds every upstream request from
+  scratch: no header the worker sends is forwarded, so no stray credential can ride along;
+- the bridge log records status, timing, token counts and the provider's error messages —
+  not the conversation, never the key: if a provider quotes the key in an error message, the
+  bridge blanks it out before logging the message or passing it on to the worker.
+
+The leak self-test still runs as usual: it tests what Claude Code sends, which does not change
+with the bridge.
+
 ## Worker permission model
 
 Workers run in `acceptEdits` with an allow/deny list (details in
@@ -77,7 +96,7 @@ Workers run in `acceptEdits` with an allow/deny list (details in
 - `printenv`/`env`/`ps`/`/proc` are denied, so the *casual* paths to other processes' secrets
   are closed;
 - the Read tool and path-first readers are denied on credential paths (`~/.claude`
-  credentials/settings, `~/.ssh`, `~/.aws`, key files, …);
+  credentials/settings, `~/.codex` auth/config, `~/.ssh`, `~/.aws`, key files, bridge tokens, …);
 - git is restricted to branch-local, non-history-rewriting operations by rule, and workers are
   instructed accordingly;
 - everything else is denied-by-default in headless mode and surfaced to the lead.
@@ -95,17 +114,24 @@ Workers run in `acceptEdits` with an allow/deny list (details in
 - For hard isolation, run the whole thing inside a VM or container. That composes cleanly:
   nothing in multiagents assumes it owns the machine.
 - Data residency: with the `deepseek` provider your prompts, code excerpts and worker traffic go
-  to servers in China under DeepSeek's terms; with `fireworks`, to Fireworks' US infrastructure.
-  Choose per project.
+  to servers in China under DeepSeek's terms; with `fireworks` or `hive`, to that company's US
+  infrastructure under its terms. Choose per project.
 
 ## Key handling summary
 
 | Where a key may live | How the worker gets it | Notes |
 |---|---|---|
-| macOS Keychain (`fireworks-api` / `deepseek-api`) | `apiKeyHelper` runs `security find-generic-password -w` | recommended on macOS |
-| `~/.multiagents/<provider>.key` (0600) | `apiKeyHelper` runs `cat` | Linux default |
-| `FIREWORKS_API_KEY` / `DEEPSEEK_API_KEY` env | staged to `~/.multiagents/<provider>.env.key` (0600); helper `cat`s that | the variable itself never reaches workers |
+| `FIREWORKS_API_KEY` / `DEEPSEEK_API_KEY` / `HIVE_API_KEY` env | staged to `~/.multiagents/<provider>.env.key` (0600); helper `cat`s that | the variable itself never reaches workers |
+| macOS Keychain (`fireworks-api` / `deepseek-api` / `hive-api`) | `apiKeyHelper` runs `security find-generic-password -w` | recommended on macOS |
+| `~/.multiagents/<provider>.key` (0600) | `apiKeyHelper` runs `cat` | Linux / Windows default |
+| any of the above, `"api": "openai"` provider | not at all: the CLI reads it for the bridge; the worker gets a one-run bridge token | see layer 5 |
+
+The first source found wins, in the order of the table. Where the CLI needs the key itself
+(`doctor`, `models`, the bridge) it reads it in-process, without a shell — so nothing in the
+current folder (the repo) can stand in for `cat` — and it refuses a key containing spaces, line
+breaks or non-ASCII characters, without printing it.
 
 Keys are never printed, never passed as argv, never placed in worker env, and the lead skill
 forbids echoing them. The `doctor`/`models` commands hold a key in memory only long enough to
-call the provider's API directly.
+call the provider's API directly; `run` holds it in memory for the run only with a bridged
+provider.

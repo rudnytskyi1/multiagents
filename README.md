@@ -15,11 +15,13 @@ DeepSeek models on the provider you choose per project:
 | Provider | Endpoint | Where it runs | Typical use |
 |---|---|---|---|
 | `fireworks` (default) | api.fireworks.ai | US | work projects |
+| `hive` | api-cdn.thehive.ai | US | work projects (cheapest) |
 | `deepseek` | api.deepseek.com | China | personal projects |
 
 Your subscription tokens go to thinking and verification. The bulk work is billed per token at
 DeepSeek prices — e.g. V4.1 Flash: $0.22 / $0.007 / $0.66 per 1M input / cached / output tokens
-on Fireworks, or $0.30 / $0.006 / $1.20 peak (half off-peak) on api.deepseek.com.
+on Fireworks, $0.12 / $0.0024 / $0.48 on Hive (discounted rate), or $0.30 / $0.006 / $1.20 peak
+(half off-peak) on api.deepseek.com.
 
 ```
 you ──► lead (your Claude Code / Codex session)
@@ -39,7 +41,7 @@ you ──► lead (your Claude Code / Codex session)
 
 - Claude Code (desktop app or CLI) — it is both the lead's home and the workers' engine.
 - `git` and `python3` 3.9+ (standard library only).
-- An API key for [Fireworks](https://fireworks.ai) and/or
+- An API key for [Fireworks](https://fireworks.ai), [Hive](https://thehive.ai) and/or
   [DeepSeek](https://platform.deepseek.com).
 
 ## Install
@@ -57,16 +59,20 @@ instead. Plugins installed with the CLI also load in the desktop app's Code tab.
 
 ### Codex (optional)
 
+The repo is a Codex plugin too:
+
 ```bash
 multiagents install-codex
 ```
 
-Run it from a Claude Code session with the plugin enabled, or directly from a clone as
-`<clone>/bin/multiagents install-codex`. It installs the `$multiagents-lead` skill into
-`~/.agents/skills` and links the CLI into `~/.local/bin` (make sure that is on your PATH).
-Start a new Codex session and invoke `$multiagents-lead`. Workers still run on the Claude Code
-engine, so keep the `claude` CLI installed; Codex may ask you to approve network access when a
-worker runs — that is the worker talking to the model API.
+Run it from a Claude Code session with the plugin enabled, or from a clone as
+`<clone>/bin/multiagents install-codex`. It registers the marketplace and installs the plugin
+through Codex's own `codex plugin` CLI (found on PATH or inside the ChatGPT/Codex desktop app).
+By hand: `codex plugin marketplace add rudnytskyi1/multiagents`, then
+`codex plugin add multiagents@multiagents`. In a new Codex thread: `$multiagents:lead <task>`.
+Workers still run on the Claude Code engine, so keep the `claude` CLI installed. Codex asks you
+to approve worker commands outside its sandbox — they need the network and the Keychain.
+Details: [docs/codex.md](docs/codex.md).
 
 ### API keys
 
@@ -80,7 +86,11 @@ security add-generic-password -s fireworks-api -a "$USER" -w
 security add-generic-password -s deepseek-api -a "$USER" -w
 ```
 
-Elsewhere: `export FIREWORKS_API_KEY=…` / `DEEPSEEK_API_KEY=…`, or
+```bash
+security add-generic-password -s hive-api -a "$USER" -w
+```
+
+Elsewhere: `export FIREWORKS_API_KEY=…` / `DEEPSEEK_API_KEY=…` / `HIVE_API_KEY=…`, or
 `~/.multiagents/<provider>.key` with `chmod 600`. (A key found in the environment is staged into
 a 0600 file so workers never see it in their env.) Then run `/multiagents:setup` in Claude Code,
 or `multiagents doctor` in a terminal.
@@ -95,6 +105,11 @@ With `deepseek`, your prompts and code go to servers in China under DeepSeek's t
 per project deliberately. Model notes: on api.deepseek.com use `deepseek-flash` (V4.1-Flash:
 vision, 1M context; the default for every role) or the `pro` alias (`deepseek-v4-pro`: stronger,
 no vision). The legacy `deepseek-chat` / `deepseek-reasoner` ids were discontinued in July 2026.
+
+Hive serves DeepSeek only through an OpenAI-compatible API, while workers speak Anthropic's. For
+`hive` (and any provider marked `"api": "openai"`) each run starts a small translation bridge on
+127.0.0.1 that holds the key; the worker only gets a one-run token for it. Details:
+[docs/providers.md](docs/providers.md#hive).
 
 ## Use
 
@@ -129,7 +144,7 @@ multiagents diff T00N [--stat|--last]  changes vs base; --last = last round only
 multiagents accept T00N [--squash]     merge the task branch into its base branch
 multiagents reject T00N                abandon (the branch is kept)
 multiagents selftest                   re-run the credential leak self-test
-multiagents install-codex              install the lead skill into OpenAI Codex
+multiagents install-codex              install or update the plugin in OpenAI Codex (keeps its source)
 ```
 
 Task files live in `.multiagents/` in your repo (auto-added to `.git/info/exclude`). Each round
@@ -158,7 +173,8 @@ Merge order (later wins): built-in defaults → the selected provider's block �
 - **Trust boundary:** a repo's `.claude/multiagents.json` is untrusted input, so only these keys
   are honored from it: `provider`, `models`, `aliases`, `prices`, `allow`, `deny`,
   `permission_mode` (not bypassPermissions), `max_turns`, `timeout_minutes`,
-  `idle_timeout_minutes`, `use_branches`, `worktrees`, `branch_prefix`. Endpoints, key sources, the claude
+  `idle_timeout_minutes`, `use_branches`, `worktrees`, `branch_prefix`, `worktree_link` (confined
+  to the repo). Endpoints, key sources, the claude
   binary, worker home and worker env can only be set in `~/.multiagents/config.json` — a cloned
   repo must not be able to redirect your keys or run its own binary.
 - **Models:** per role via config, `MULTIAGENTS_<ROLE>_MODEL`, or `--model` per run.
@@ -168,7 +184,8 @@ Merge order (later wins): built-in defaults → the selected provider's block �
   `allow`. `curl` is allowed only against localhost.
 - **Custom providers:** add blocks under `"providers"` in `~/.multiagents/config.json` (fields:
   `base_url`, `models_url`, `keychain_service`, `key_file`, `key_env`, `models`, `aliases`,
-  `prices`); any Anthropic-compatible endpoint works.
+  `prices`); any Anthropic-compatible endpoint works, and any OpenAI-compatible one with
+  `"api": "openai"` (through the local bridge).
 
 ## Security
 
@@ -178,7 +195,10 @@ send the **subscription OAuth token** to the custom `ANTHROPIC_BASE_URL`, even w
 `ANTHROPIC_API_KEY` set. multiagents layers these defenses:
 
 1. **Clean environment.** Every inherited `ANTHROPIC_*` / `CLAUDE*` variable is stripped, and so
-   is every provider's key variable (the key travels only via `apiKeyHelper`).
+   is every provider's key variable (the key travels only via `apiKeyHelper`). With an
+   OpenAI-API provider such as Hive, the key never reaches the worker at all: it stays in the
+   loopback bridge inside the CLI process, and the worker authenticates to the bridge with a
+   random one-run token.
 2. **Separate config dir.** Workers get their own `CLAUDE_CONFIG_DIR`
    (`~/.multiagents/worker-home`) — your stored login is never found. Your `agents/`, `skills/`
    and `CLAUDE.md` are symlinked in; your MCP servers and plugins are not.
@@ -189,7 +209,7 @@ send the **subscription OAuth token** to the custom `ANTHROPIC_BASE_URL`, even w
    refuse to run.
 4. **Untrusted project config** (see the trust boundary above), a per-task worker lock
    (repo-wide in legacy non-worktree mode),
-   read-denies on credential paths (`~/.claude`, `~/.ssh`, `~/.aws`, …), and no MCP servers or
+   read-denies on credential paths (`~/.claude`, `~/.codex`, `~/.ssh`, `~/.aws`, …), and no MCP servers or
    telemetry in workers.
 
 **Honest limits:** the deny list blocks the plain spellings of `git push`, history rewrites and

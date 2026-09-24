@@ -13,6 +13,9 @@ In any Claude Code session:
 install command. CLI installs also load in the desktop app's Code tab. Restart the session
 after installing.)
 
+Using OpenAI Codex as the lead instead (or as well)? Run `multiagents install-codex` and see
+[codex.md](codex.md); the rest of this guide applies unchanged.
+
 ## 2. Store an API key
 
 Pick a provider ([providers.md](providers.md)) and store its key — the command prompts for the
@@ -26,8 +29,16 @@ security add-generic-password -s fireworks-api -a "$USER" -w     # Fireworks
 security add-generic-password -s deepseek-api -a "$USER" -w      # DeepSeek direct
 ```
 
-Not on macOS: `export FIREWORKS_API_KEY=…` (or `DEEPSEEK_API_KEY`) in your shell profile, or
-write the key to `~/.multiagents/fireworks.key` / `deepseek.key` and `chmod 600` it. On
+```bash
+security add-generic-password -s hive-api -a "$USER" -w          # Hive
+```
+
+With Hive, also make it the provider: `multiagents provider hive` (or per project, see
+[providers.md](providers.md#switching)).
+
+Not on macOS: `export FIREWORKS_API_KEY=…` (or `DEEPSEEK_API_KEY` / `HIVE_API_KEY`) in your
+shell profile, or write the key to `~/.multiagents/fireworks.key` / `deepseek.key` / `hive.key`
+and `chmod 600` it. On
 Windows: `%USERPROFILE%\.multiagents\fireworks.key`, or a user environment variable with the
 same name (see the Windows section in [troubleshooting.md](troubleshooting.md#windows)).
 
@@ -38,7 +49,8 @@ multiagents doctor
 ```
 
 Expect every line OK/PASS: binary, provider, key, endpoint, models, the credential-isolation
-self-test, repo state. In Claude Code you can instead say `/multiagents:setup` and let the
+self-test, repo state. (On Hive the endpoint line reads `--`: it has no model list, so each
+model gets a real test request instead.) In Claude Code you can instead say `/multiagents:setup` and let the
 model walk through it.
 
 ## 4. First task
@@ -91,6 +103,7 @@ Notes for real projects:
 ```
 claude plugin disable multiagents@multiagents     # keep, but off
 claude plugin uninstall multiagents@multiagents   # remove
+codex plugin remove multiagents@multiagents       # Codex, if installed there
 ```
 
 State to clean up if you want a full wipe: `~/.multiagents/` and any `.multiagents/` folders

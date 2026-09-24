@@ -1,0 +1,6 @@
+interface:
+  display_name: "multiagents setup"
+  short_description: "Check keys, providers and worker isolation"
+  default_prompt: "Use $multiagents:setup to check that the multiagents workers are ready."
+policy:
+  allow_implicit_invocation: true

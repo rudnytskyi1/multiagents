@@ -1,0 +1,39 @@
+{
+  "name": "multiagents",
+  "version": "0.4.0",
+  "description": "Your Codex session leads: it plans, reviews code, and checks the UI. Cheap DeepSeek workers (Fireworks, Hive or api.deepseek.com) write, test, and fix the code, with your review agents in the loop.",
+  "author": {
+    "name": "rudnytskyi1",
+    "url": "https://github.com/rudnytskyi1"
+  },
+  "homepage": "https://github.com/rudnytskyi1/multiagents",
+  "repository": "https://github.com/rudnytskyi1/multiagents",
+  "license": "MIT",
+  "keywords": [
+    "multi-agent",
+    "orchestration",
+    "deepseek",
+    "fireworks",
+    "code-review",
+    "workers"
+  ],
+  "skills": "./codex/skills/",
+  "interface": {
+    "displayName": "multiagents",
+    "shortDescription": "Lead a team of cheap DeepSeek workers",
+    "longDescription": "Turns your Codex session into a team lead. The lead plans, writes precise task specs, reviews the code and the running UI, and sends feedback. Workers are headless Claude Code processes running DeepSeek models on Fireworks (US), Hive (US) or api.deepseek.com: they write the code, run builds, tests and your review agents, and fix what the lead points out. Start with $multiagents:lead <task>.",
+    "developerName": "rudnytskyi1",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/rudnytskyi1/multiagents",
+    "defaultPrompt": [
+      "$multiagents:lead build this feature with the worker team",
+      "$multiagents:setup check that the workers are set up"
+    ],
+    "brandColor": "#4F46E5"
+  }
+}

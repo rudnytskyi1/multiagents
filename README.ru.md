@@ -11,13 +11,18 @@ UI. Воркеры — headless-процессы Claude Code на моделях
 | | Эндпоинт | Серверы | Когда |
 |---|---|---|---|
 | `fireworks` (по умолчанию) | api.fireworks.ai | США | рабочие проекты |
+| `hive` | api-cdn.thehive.ai | США | рабочие проекты (дешевле всего) |
 | `deepseek` | api.deepseek.com | Китай | личные проекты |
 
-Выбор: в проекте — `.claude/multiagents.json` → `{"provider": "deepseek"}`; глобально —
-`multiagents provider deepseek`. С `deepseek` код и промпты уходят на китайские серверы —
-выбирайте осознанно. Модель по умолчанию везде `deepseek-flash` (V4.1: зрение, контекст 1M);
-цены: Fireworks $0.22/$0.007/$0.66 за 1M токенов, DeepSeek пик $0.30/$0.006/$1.20 (вне пика
-вдвое дешевле).
+Выбор: в проекте — `.claude/multiagents.json` → `{"provider": "hive"}`; глобально —
+`multiagents provider hive`. С `deepseek` код и промпты уходят на китайские серверы —
+выбирайте осознанно. Модель везде DeepSeek V4.1 Flash (зрение, контекст 1M); цены за 1M
+токенов (вход / кэш / выход): Fireworks $0.22/$0.007/$0.66, Hive $0.12/$0.0024/$0.48 (цена со
+скидкой), DeepSeek пик $0.30/$0.006/$1.20 (вне пика вдвое дешевле).
+
+У Hive есть только OpenAI-совместимый API, а воркеры говорят на API Anthropic. Поэтому на время
+каждого запуска CLI поднимает на 127.0.0.1 маленький мост-переводчик: ключ Hive остаётся внутри
+моста, воркер получает лишь одноразовый токен к нему.
 
 ## Установка
 
@@ -36,8 +41,17 @@ security add-generic-password -s fireworks-api -a "$USER" -w
 security add-generic-password -s deepseek-api -a "$USER" -w
 ```
 
-Проверка: `multiagents doctor` (или `/multiagents:setup` в чате). Для Codex:
-`multiagents install-codex`, затем в новой сессии Codex — `$multiagents-lead <задача>`.
+```bash
+security add-generic-password -s hive-api -a "$USER" -w
+```
+
+Проверка: `multiagents doctor` (или `/multiagents:setup` в чате).
+
+Для Codex (репозиторий — ещё и Codex-плагин): `multiagents install-codex` — команда сама найдёт
+`codex` (в PATH или внутри приложения ChatGPT/Codex), добавит маркетплейс и установит плагин;
+повторный запуск обновляет плагин из того же источника.
+Затем в новом треде Codex — `$multiagents:lead <задача>`. Команды воркеров Codex попросит
+одобрить вне песочницы: им нужны сеть и Keychain. Подробно: [docs/codex.md](docs/codex.md).
 
 ## Как пользоваться
 

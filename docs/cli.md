@@ -12,6 +12,10 @@ provider's model-listing endpoint; each configured model (`--quick` only checks 
 otherwise sends a 1-message probe); the leak self-test (`--force` ignores its cache); the repo,
 config files and effective worker settings. Exit 0 only if everything passed.
 
+Providers without a model list (Hive) always get the probe, even with `--quick`. For OpenAI-API
+providers the probe goes through the local bridge with a tool definition and a 32k output cap —
+the request shape workers send — so it checks the translation and tool calling too.
+
 ## `multiagents provider [name]`
 
 Without a name: shows the active provider and the available ones. With a name: sets the
@@ -20,7 +24,8 @@ user-wide default in `~/.multiagents/config.json`.
 ## `multiagents models [filter] [--all]`
 
 Lists model ids your key can use on the active provider (`filter` is a case-insensitive
-substring, default `deepseek`; `--all` lists everything).
+substring, default `deepseek`; `--all` lists everything). A provider without a model-list
+endpoint (Hive) gets its configured models printed instead.
 
 ## `multiagents new <slug> [--title "..."]`
 
@@ -54,6 +59,10 @@ new commits and diff stat vs base, uncommitted files, denied commands, tool erro
 retries — then the report **digest** (verdict + decision-relevant sections; scouts and failed
 rounds print the full report; the full text always stays on disk). Task id may be given as
 `T001`, `t1` or `1`.
+
+With an OpenAI-API provider (`hive`), the run starts the local bridge first (see
+[providers.md](providers.md#the-bridge)); failed bridge calls are summarized at the end and
+detailed in `NN-<role>-bridge.log`.
 
 ## `multiagents feedback <task>`
 
@@ -99,21 +108,47 @@ changes sitting in the task worktree are flagged on stderr but not shown.
 ## `multiagents accept <task> [--squash]`
 
 Refuses while that task's worker is running, if the task worktree has uncommitted changes, or
-if the main tree is dirty or not on `base_branch`. Merges the task branch into `base_branch`
+if the main tree is dirty or not on `base_branch` (untracked test caches — `__pycache__/`,
+`*.pyc`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `.hypothesis/`, `.DS_Store` — don't
+count as changes anywhere). Merges the task branch into `base_branch`
 (`--no-ff` with a `Merge T00N: <title>` message, or `--squash`), removes the task's worktree,
 and marks the task `accepted`. A conflicting merge is aborted cleanly with a pointer to
 `multiagents sync`.
 
 ## `multiagents reject <task>`
 
-Removes the task's worktree (work stays on the `ma/` branch for reference) and marks the task
-`rejected`. Legacy inline tasks are returned to `base_branch` first.
+Commits anything uncommitted in the task's worktree as a `[T00N] WIP at reject` commit, removes
+the worktree (work stays on the `ma/` branch for reference) and marks the task `rejected`.
+Legacy inline tasks are returned to `base_branch` first.
 
 ## `multiagents selftest`
 
 Forces a fresh leak self-test (see [security.md](security.md)) and prints PASS/FAIL with detail.
 
-## `multiagents install-codex [--dir DIR]`
+## `multiagents install-codex [--source SRC] [--codex PATH]`
 
-Copies the bundled Codex skill into `~/.agents/skills/multiagents-lead` (or `DIR`), links the
-CLI into `~/.local/bin`, and prints PATH guidance. See [codex.md](codex.md).
+Installs or updates the plugin in OpenAI Codex through Codex's own plugin CLI, run from your
+home folder so a repo's own `.codex/config.toml` cannot redirect it:
+
+- **Marketplace.** If a `multiagents` marketplace is already registered, its source is kept: a
+  Git one is refreshed (`codex plugin marketplace upgrade`), a local clone is read in place.
+  Otherwise it registers this clone, or the GitHub repo when run from a plugin cache.
+  `--source` replaces the source: a folder (a path starting with `/`, `.` or `~`),
+  `owner/repo[@ref]` or a git URL. If the new source fails, the previous one is restored.
+- **Plugin.** It runs `codex plugin add multiagents@multiagents`, which re-copies the plugin even
+  at the same version.
+- **Cleanup.** It removes what versions up to 0.3.0 installed: the standalone skill in
+  `~/.agents/skills`, and the `~/.local/bin` link or shims if their target is gone.
+
+`--codex` points at the `codex` binary when it is neither on PATH nor in the ChatGPT/Codex app.
+See [codex.md](codex.md).
+
+## Inside the Codex sandbox
+
+When Codex's sandbox is detected (`CODEX_SANDBOX` on macOS, or
+`CODEX_SANDBOX_NETWORK_DISABLED` on any platform), `run`, `doctor`, `selftest`, `models`,
+`accept`, `reject`, `sync`, `shot`, `install-codex` and `provider <name>` refuse with a pointer
+to re-run them escalated (they need the network, the Keychain, `~/.multiagents` and a writable
+`.git`). Any other command the sandbox stops from writing (e.g. `new` in read-only mode) gets the
+same pointer instead of a traceback. `status` shows a worker as running when the sandbox hides
+its process. `MULTIAGENTS_ALLOW_SANDBOX=1` disables the check.

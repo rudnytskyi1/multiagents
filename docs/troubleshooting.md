@@ -79,6 +79,28 @@ session id. `--fresh` forces a new session on purpose.
 That is what `multiagents diff` and the lead review are for: `reject` the task, tighten the
 spec's "Out of scope", and re-run. Branches keep main safe.
 
+## Hive and other OpenAI-API providers
+
+**`model FAIL … HTTP 405 (Hive answers 405 when the organization is paused …)`**
+Hive pauses an organization with no credit left. Top up the balance at thehive.ai, then re-run
+`multiagents doctor`.
+
+**`model FAIL … HTTP 401`** — the key is wrong or not a V3 "Secret Key". Replace it:
+`security delete-generic-password -s hive-api`, then store it again.
+
+**`API retries` with 429 in the run summary** — Hive allows 5 requests/second by default;
+Claude Code backs off and retries on its own. Parallel tasks share the limit; ask Hive for a
+higher one if it slows you down.
+
+**A run fails with `api_error` and the bridge is mentioned** — `NN-<role>-bridge.log` in the
+task folder has one line per API call with the provider's status and message. To see exactly
+what the provider received, re-run with `MULTIAGENTS_BRIDGE_DUMP=/some/folder`: every translated
+request is saved there as JSON (your code and prompts — delete the folder afterwards; the key is
+never in it).
+
+**`max_tokens` rejected** — set `"max_output_tokens"` in the provider block of
+`~/.multiagents/config.json` to the provider's limit.
+
 ## Screenshots
 
 **Blank PNG at `--width < 500`**
@@ -100,13 +122,20 @@ now falls back to directory junctions and then to auto-refreshed copies. Update 
 For developers) also makes real symlinks work, but is not required.
 
 **`python3` not found**
-Windows installs Python as `python` / the `py` launcher; there is no `python3` shim. v0.2.1's
-launchers try `python3`, then `python`, then `py -3` (and reject the Microsoft Store stub).
-If none exist, install Python 3.9+ from python.org and re-run.
+Windows installs Python as `python` / the `py` launcher; there is no `python3` shim. The
+launchers try `py -3` and `python` (`bin/multiagents.cmd`) or `python3`, `python`, `py -3` (the
+Git Bash script), and reject the Microsoft Store stub. If none exist, install Python 3.9+ from
+python.org and re-run.
+
+**A failed round ran twice (Windows, before 0.4.0)**
+`multiagents.cmd` used to re-run the whole command with `python` whenever it exited non-zero,
+so a failed or timed-out worker round was immediately repeated (and paid for twice). Fixed in
+0.4.0: the launcher picks one interpreter and runs once.
 
 **Storing the key (no macOS Keychain)**
-Save it to `%USERPROFILE%\.multiagents\fireworks.key` (or `deepseek.key`) as a single line, or
-set a user environment variable `FIREWORKS_API_KEY` / `DEEPSEEK_API_KEY`. The CLI stages env
+Save it to `%USERPROFILE%\.multiagents\fireworks.key` (or `deepseek.key` / `hive.key`) as a
+single line, or set a user environment variable `FIREWORKS_API_KEY` / `DEEPSEEK_API_KEY` /
+`HIVE_API_KEY`. The CLI stages env
 keys into a file itself, so workers never see the variable.
 
 **General Windows notes**
@@ -114,12 +143,39 @@ Claude Code on Windows runs shell commands through Git Bash — install Git for 
 `doctor` complains about the shell. Worker stop/timeout uses `taskkill` under the hood.
 `shot --ios` is macOS-only; `shot --url` works with Chrome or Edge installed.
 
+## Codex
+
+**`install-codex`: "Codex CLI not found"**
+The desktop app ships `codex` inside its bundle without putting it on PATH. The command also
+looks in `/Applications/ChatGPT.app/Contents/Resources/codex` and `Codex.app`; elsewhere, pass
+`--codex /path/to/codex`.
+
+**`$multiagents:lead` is missing, or Codex shows two lead skills**
+Start a new thread — Codex loads plugins per thread. A leftover `$multiagents-lead` (no colon)
+is the standalone skill from ≤ 0.3.0; `install-codex` removes it, or delete
+`~/.agents/skills/multiagents-lead` by hand. `codex plugin list --marketplace multiagents` shows
+what is installed.
+
+**"has to run outside the Codex sandbox"**
+Expected when Codex tried a worker command sandboxed: approve the escalated re-run. To stop
+being asked each time, accept the suggested prefix rule (e.g. `…/bin/multiagents run`).
+
+**"no API key found" in Codex, but the key is in the Keychain**
+The command ran inside the sandbox, which hides the Keychain (older versions of the CLI did
+not detect this). Re-run it escalated.
+
+**A new version is out, Codex still runs the old one**
+For a local clone, `git pull` it first. Then run `multiagents install-codex` again (it keeps your
+marketplace source and re-copies the plugin), and start a new thread.
+
 ## Reading the artifacts
 
 - `NN-<role>.log` — timeline: every tool call, `[error]` tool failures, `[stderr]` from the
   worker process, `[retry]` API retries. `grep error` it first.
 - `NN-<role>-report.md` — what the worker claims; the lead treats it as a claim.
 - `NN-<role>.jsonl` — full protocol transcript; heavy, last resort.
+- `NN-<role>-bridge.log` — OpenAI-API providers only: status, time and tokens per API call,
+  and the provider's error messages.
 - `task.json` — rounds with outcome, tokens, cost, session ids, head commits.
 
 ## Resetting

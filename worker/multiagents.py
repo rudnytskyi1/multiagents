@@ -3,13 +3,16 @@
 
 The lead is your normal Claude Code session (for example Opus on a Claude subscription).
 It plans, writes task specs and reviews. This CLI runs the workers that write, test and fix
-code against the configured provider (Fireworks, api.deepseek.com, or any Anthropic-compatible
-endpoint). Each worker is a headless `claude -p` process isolated from the lead's credentials:
+code against the configured provider (Fireworks, api.deepseek.com, Hive, or any Anthropic- or
+OpenAI-compatible endpoint). Each worker is a headless `claude -p` process isolated from the
+lead's credentials:
 
   * every ANTHROPIC_* / CLAUDE* variable inherited from the host session is stripped
     (the desktop app passes its subscription auth to child processes through them),
   * the worker gets its own CLAUDE_CONFIG_DIR, so the lead's stored login is never found,
-  * the provider API key reaches Claude Code only through apiKeyHelper,
+  * the provider API key reaches Claude Code only through apiKeyHelper; for providers that
+    only speak the OpenAI API, the key stays inside a loopback bridge (openai_bridge.py) and
+    the worker gets a per-run token for the bridge instead,
   * before the first real run on a given Claude Code build, a leak self-test points a worker
     at a local capture server and refuses to continue unless only the canary key was sent.
 
@@ -37,7 +40,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 ROOT = Path(__file__).resolve().parent.parent
 PROMPTS = ROOT / "worker" / "prompts"
 TEMPLATES = ROOT / "worker" / "templates"
@@ -46,9 +49,13 @@ USER_CONFIG = STATE_HOME / "config.json"
 PROJECT_CONFIG = Path(".claude") / "multiagents.json"
 TEAM_DIR = ".multiagents"
 ROLES = ("coder", "reviewer", "fixer", "scout")
+# Commands that cannot work inside the Codex sandbox (see main()).
+SANDBOX_HOSTILE = ("run", "doctor", "selftest", "models", "accept", "reject", "sync", "shot",
+                   "install-codex")
 
 FW_FLASH = "accounts/fireworks/models/deepseek-v4p1-flash"
 DS_FLASH = "deepseek-flash"
+HIVE_FLASH = "deepseek-ai/deepseek-v4.1-flash"
 
 DEFAULT_CONFIG = {
     # Provider-independent settings. Provider-specific ones live under "providers";
@@ -82,6 +89,22 @@ DEFAULT_CONFIG = {
             "prices": {DS_FLASH: {"input": 0.30, "cached_input": 0.006, "output": 1.20},
                        "deepseek-v4-pro": {"input": 1.32, "cached_input": 0.044, "output": 3.96}},
         },
+        "hive": {
+            "label": "Hive (thehive.ai, US) via the local OpenAI bridge",
+            # Hive serves DeepSeek only through OpenAI-style /chat/completions, so workers
+            # reach it through openai_bridge.py (see WorkerEndpoint).
+            "api": "openai",
+            "base_url": "https://api-cdn.thehive.ai/api/v3",
+            "models_url": "",  # Hive has no model-list endpoint
+            "keychain_service": "hive-api",
+            "key_file": str(STATE_HOME / "hive.key"),
+            "key_env": "HIVE_API_KEY",
+            "models": {"coder": HIVE_FLASH, "fixer": HIVE_FLASH, "reviewer": HIVE_FLASH,
+                       "scout": HIVE_FLASH, "background": HIVE_FLASH},
+            "aliases": {"flash": HIVE_FLASH},
+            # Discounted rates as listed on thehive.ai/pricing (list price 0.30 / 0.006 / 1.20).
+            "prices": {HIVE_FLASH: {"input": 0.12, "cached_input": 0.0024, "output": 0.48}},
+        },
     },
     "permission_mode": "acceptEdits",
     "allow": [],
@@ -101,8 +124,11 @@ DEFAULT_CONFIG = {
 PROJECT_SAFE_KEYS = {
     "provider", "models", "aliases", "prices", "allow", "deny", "permission_mode",
     "max_turns", "timeout_minutes", "idle_timeout_minutes", "use_branches", "worktrees",
-    "branch_prefix",
+    "branch_prefix", "worktree_link",
 }
+# Endpoint/key plumbing: honored only inside providers.<name> in the user config.
+PROVIDER_ONLY = ("base_url", "models_url", "keychain_service", "key_file", "key_env", "label",
+                 "api", "max_output_tokens", "extra_body")
 
 # Tools a worker may run without a prompt (anything else is denied in headless mode and
 # reported back, so the lead can extend "allow" in .claude/multiagents.json).
@@ -143,27 +169,40 @@ DEFAULT_DENY = [
 # symlinks the user's agents/skills from ~/.claude, which workers legitimately read.
 SECRET_PATHS = (
     ".claude/.credentials.json", ".claude/settings.json", ".claude/settings.local.json",
-    ".claude.json", ".ssh", ".aws", ".config/gh", ".netrc", ".gnupg",
+    ".claude.json", ".codex/auth.json", ".codex/.credentials.json", ".codex/config.toml",
+    ".ssh", ".aws", ".config/gh", ".netrc", ".gnupg",
 )
 # Readers that take the path as their first argument (prefix rules can't catch pattern-first
 # tools like grep/jq — that residual risk is documented under "Honest limits" in the README).
 _PATH_FIRST_READERS = ("cat", "head", "tail", "less", "more", "od", "strings", "file", "stat", "wc")
 
 
-def _secret_denies() -> list:
+def _secret_denies(cfg: dict | None = None) -> list:
     home = Path.home()
     rules = []
     for p in SECRET_PATHS:
         rules += [f"Read(/{home}/{p}/**)", f"Read(/{home}/{p})", f"Read(/{home}/{p}*)"]
         for r in _PATH_FIRST_READERS:
             rules += [f"Bash({r} {home}/{p}*)", f"Bash({r} ~/{p}*)", f"Bash({r} $HOME/{p}*)"]
-    for f in ("*.key", "*.env.key", "config.json", "selftest.json"):
+    # Relocated credential stores (CODEX_HOME / a custom CLAUDE_CONFIG_DIR of the lead).
+    for base, names in ((os.environ.get("CODEX_HOME"), ("auth.json", ".credentials.json", "config.toml")),
+                        (os.environ.get("CLAUDE_CONFIG_DIR"), (".credentials.json", "settings.json",
+                                                               "settings.local.json"))):
+        if not base:
+            continue
+        for name in names:
+            path = Path(base).expanduser() / name
+            rules.append(f"Read(/{path})")
+            rules += [f"Bash({r} {path}*)" for r in _PATH_FIRST_READERS]
+    for f in ("*.key", "*.env.key", "*.token", "config.json", "selftest.json", "run/**"):
         rules.append(f"Read(/{STATE_HOME}/{f})")
     for r in _PATH_FIRST_READERS:
-        rules += [f"Bash({r} {STATE_HOME}/config.json*)", f"Bash({r} {STATE_HOME}/selftest.json*)"]
-    rules += [f"Bash({r} {STATE_HOME}/{k}*)" for r in _PATH_FIRST_READERS
-              for k in ("fireworks", "deepseek")] + [f"Bash({r} ~/.multiagents/{k}*)"
-              for r in _PATH_FIRST_READERS for k in ("fireworks", "deepseek")]
+        rules += [f"Bash({r} {STATE_HOME}/config.json*)", f"Bash({r} {STATE_HOME}/selftest.json*)",
+                  f"Bash({r} {STATE_HOME}/run/*)"]
+    names = set((cfg or {}).get("_providers") or DEFAULT_CONFIG["providers"]) | set(DEFAULT_CONFIG["providers"])
+    for k in sorted(names):
+        rules += [f"Bash({r} {STATE_HOME}/{k}*)" for r in _PATH_FIRST_READERS]
+        rules += [f"Bash({r} ~/.multiagents/{k}*)" for r in _PATH_FIRST_READERS]
     return rules
 
 
@@ -180,7 +219,7 @@ def kill_tree(proc: "subprocess.Popen", hard: bool = False) -> None:
     """Terminate a worker and everything it spawned, on both platforms."""
     try:
         if IS_WINDOWS:
-            args = ["taskkill", "/T", "/PID", str(proc.pid)]
+            args = [exe("taskkill"), "/T", "/PID", str(proc.pid)]
             if hard:
                 args.insert(1, "/F")
             subprocess.run(args, capture_output=True)
@@ -193,6 +232,44 @@ def kill_tree(proc: "subprocess.Popen", hard: bool = False) -> None:
 def sh_path(p) -> str:
     """A path for a shell command line that also works in Git Bash on Windows."""
     return shlex.quote(str(p).replace("\\", "/"))
+
+
+def find_exe(name: str) -> str | None:
+    """shutil.which without Windows' implicit search of the current directory first: commands
+    run inside a repo that may come from anyone, and it could plant e.g. claude.cmd there."""
+    if not IS_WINDOWS or os.path.dirname(name):
+        return shutil.which(name)
+    exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e]
+    names = ([name] if os.path.splitext(name)[1] else []) + [name + e for e in exts]
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        d = d.strip().strip('"')
+        if not d or not os.path.isabs(d):
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def in_codex_sandbox() -> bool:
+    """True inside Codex's command sandbox: CODEX_SANDBOX=seatbelt on macOS, and on every
+    platform CODEX_SANDBOX_NETWORK_DISABLED=1 when the sandbox cuts the network."""
+    return bool(os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED"))
+
+
+_EXE_CACHE: dict = {}
+
+
+def exe(name: str) -> str:
+    """The tool to spawn. On Windows, an absolute path: CreateProcess otherwise tries the
+    current directory (the repo) before PATH, so a repo could ship its own git.exe."""
+    if not IS_WINDOWS:
+        return name
+    if name not in _EXE_CACHE:
+        _EXE_CACHE[name] = find_exe(name) or name
+    return _EXE_CACHE[name]
+
 
 # Variables kept even though they match the stripped prefixes. On Windows, Claude Code needs
 # CLAUDE_CODE_GIT_BASH_PATH to find the shell its Bash tool (and apiKeyHelper) run in.
@@ -260,7 +337,8 @@ def write_json(path: Path, data) -> None:
 
 def git(repo: Path, *args: str, check: bool = True) -> str:
     try:
-        r = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+        r = subprocess.run([exe("git"), *args], cwd=repo, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
     except FileNotFoundError:
         die("git not found on PATH (multiagents requires git)")
     if check and r.returncode != 0:
@@ -272,7 +350,7 @@ def repo_root() -> Path:
     """The MAIN repository root — also when invoked from inside a task worktree, whose own
     toplevel would otherwise hide .multiagents/ and every task."""
     try:
-        r = subprocess.run(["git", "rev-parse", "--show-toplevel", "--git-common-dir"],
+        r = subprocess.run([exe("git"), "rev-parse", "--show-toplevel", "--git-common-dir"],
                            capture_output=True, text=True)
     except FileNotFoundError:
         die("git not found on PATH (multiagents requires git)")
@@ -311,7 +389,6 @@ def load_config(repo: Path | None) -> dict:
     # generic defaults -> selected provider block -> user top-level overrides -> project (safe keys).
     # Endpoint/key plumbing is only accepted inside providers.<name>: a top-level override there
     # would silently pair one vendor's key with another vendor's endpoint when the provider switches.
-    PROVIDER_ONLY = ("base_url", "models_url", "keychain_service", "key_file", "key_env", "label")
     stray = sorted(set(user) & set(PROVIDER_ONLY))
     if stray:
         print(f"multiagents: ignoring top-level {', '.join(stray)} in {USER_CONFIG} — "
@@ -323,7 +400,12 @@ def load_config(repo: Path | None) -> dict:
     cfg = deep_merge(cfg, {k: v for k, v in project.items() if k != "provider"})
     cfg["provider_name"] = sel
     cfg["_providers"] = providers  # full map, e.g. so worker_env can strip every key_env
-    cfg.setdefault("models_url", cfg["base_url"].rstrip("/") + "/v1/models")
+    cfg["_from_project"] = sorted(project)  # provision_worktree is stricter with these
+    cfg["api"] = cfg.get("api") or "anthropic"
+    if cfg["api"] not in ("anthropic", "openai"):
+        die(f"provider {sel!r}: \"api\" must be \"anthropic\" or \"openai\", not {cfg['api']!r}")
+    if "models_url" not in cfg:  # "" = the provider has no model list
+        cfg["models_url"] = cfg["base_url"].rstrip("/") + ("/models" if cfg["api"] == "openai" else "/v1/models")
     for role in ROLES:
         env_model = os.environ.get(f"MULTIAGENTS_{role.upper()}_MODEL")
         if env_model:
@@ -334,7 +416,7 @@ def load_config(repo: Path | None) -> dict:
 def load_config_here() -> dict:
     """Config for commands that may run outside a repo: use the repo's if we are in one."""
     try:
-        r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        r = subprocess.run([exe("git"), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
         return load_config(Path(r.stdout.strip()) if r.returncode == 0 else None)
     except FileNotFoundError:
         return load_config(None)
@@ -357,7 +439,7 @@ def claude_bin(cfg: dict) -> str:
     for cand in (os.environ.get("MULTIAGENTS_CLAUDE_BIN"), cfg.get("claude_bin"), os.environ.get("CLAUDE_CODE_EXECPATH")):
         if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
-    found = shutil.which("claude")
+    found = find_exe("claude")
     if found:
         return found
     die("Claude Code executable not found; install the CLI or set MULTIAGENTS_CLAUDE_BIN")
@@ -369,36 +451,74 @@ def claude_version(binary: str) -> str:
     return (r.stdout.strip() or r.stderr.strip()).split(" ")[0]
 
 
+def _key_location(cfg: dict) -> tuple[str | None, str | None]:
+    """Where the active provider's key is: ("env", variable), ("keychain", service),
+    ("file", path) or (None, None). Checked in this order."""
+    env_name = cfg.get("key_env") or ""
+    if env_name and os.environ.get(env_name):
+        return "env", env_name
+    service = cfg["keychain_service"]
+    if sys.platform == "darwin" and find_exe("security"):
+        r = subprocess.run([exe("security"), "find-generic-password", "-s", service], capture_output=True)
+        if r.returncode == 0:
+            return "keychain", service
+    key_file = Path(cfg["key_file"]).expanduser()
+    if key_file.is_file():
+        return "file", str(key_file)
+    return None, None
+
+
 def key_source(cfg: dict) -> tuple[str | None, str | None]:
     """Return (description, shell command that prints the key). Never returns the key itself.
 
     A key found in the environment is copied into a 0600 file and served from there, so the
-    variable can always be stripped from worker processes (workers never see the key in env)."""
-    env_name = cfg.get("key_env") or ""
-    env_val = os.environ.get(env_name) if env_name else None
-    if env_val:
+    variable can always be stripped from worker processes (workers never see the key in env).
+    Not for an "api": "openai" provider: the bridge reads the variable itself, and the worker
+    gets no helper for the key at all (so no copy of it is left on disk either)."""
+    kind, where = _key_location(cfg)
+    if kind == "env" and cfg.get("api") == "openai":
+        return f"env {where} (read by the bridge)", ""
+    if kind == "env":
         staged = STATE_HOME / f"{cfg.get('provider_name', 'default')}.env.key"
         STATE_HOME.mkdir(parents=True, exist_ok=True)
         fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
-            f.write(env_val)
-        return f"env {env_name} (staged to {staged})", f"cat {sh_path(staged)}"
-    service = cfg["keychain_service"]
-    if sys.platform == "darwin" and shutil.which("security"):
-        r = subprocess.run(["security", "find-generic-password", "-s", service], capture_output=True)
-        if r.returncode == 0:
-            return f'macOS Keychain "{service}"', f"security find-generic-password -s {shlex.quote(service)} -w"
-    key_file = Path(cfg["key_file"]).expanduser()
-    if key_file.is_file():
-        return f"file {key_file}", f"cat {sh_path(key_file)}"
+            f.write(os.environ[where])
+        return f"env {where} (staged to {staged})", f"cat {sh_path(staged)}"
+    if kind == "keychain":
+        return f'macOS Keychain "{where}"', f"security find-generic-password -s {shlex.quote(where)} -w"
+    if kind == "file":
+        return f"file {where}", f"cat {sh_path(where)}"
     return None, None
 
 
-def read_key(helper: str) -> str:
-    r = subprocess.run(helper, shell=True, capture_output=True, text=True)
-    key = r.stdout.strip()
-    if r.returncode != 0 or not key:
-        die("could not read the API key")
+def read_key(cfg: dict) -> str:
+    """The key itself, for this process only (doctor, models, the OpenAI bridge), found the way
+    key_source finds it. Read without a shell: on Windows cmd.exe would run a `cat` from the
+    current directory, i.e. the repo, first. Never printed, not even when it is malformed."""
+    kind, where = _key_location(cfg)
+    key = ""
+    if kind == "env":
+        key = os.environ.get(where, "")
+    elif kind == "keychain":
+        r = subprocess.run([exe("security"), "find-generic-password", "-s", where, "-w"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        key = r.stdout if r.returncode == 0 else ""
+    elif kind == "file":
+        try:
+            key = Path(where).read_text(encoding="utf-8-sig", errors="replace")  # -sig: Notepad's BOM
+        except OSError:
+            key = ""
+    key = key.strip()
+    if kind is None:
+        die(no_key_help(cfg))
+    label = {"env": f"the {where} environment variable", "keychain": f'the macOS Keychain entry "{where}"',
+             "file": f"the file {where}"}[kind]
+    if not key:
+        die(f"could not read the API key from {label}")
+    if not all("!" <= c <= "~" for c in key):
+        die(f"the API key in {label} contains spaces, line breaks or non-ASCII characters, which an "
+            "API key does not have; store it again (it is not shown here)")
     return key
 
 
@@ -414,7 +534,68 @@ def no_key_help(cfg: dict) -> str:
             f"or put it in {cfg['key_file']} (chmod 600).")
 
 
+# ----------------------------------------------------------------------------- OpenAI bridge
+
+def new_bridge(cfg: dict, key: str, log_path: Path | None = None):
+    """An (unstarted) Anthropic->OpenAI bridge for an "api": "openai" provider."""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import openai_bridge
+    models = sorted({resolve_model(cfg, m) for m in (cfg.get("models") or {}).values() if m})
+    return openai_bridge.Bridge(cfg["base_url"], key, models=models,
+                                max_tokens_cap=cfg.get("max_output_tokens"),
+                                extra_body=cfg.get("extra_body"),
+                                log_path=str(log_path) if log_path else None,
+                                curl=exe("curl") if find_exe("curl") else "")
+
+
+class WorkerEndpoint:
+    """Where a worker's Claude Code sends its API calls, and the apiKeyHelper it gets.
+
+    Anthropic-API providers: straight to the provider; the helper prints the provider key.
+    OpenAI-API providers: to a loopback bridge in this process, which alone holds the key;
+    the helper prints a per-run bridge token from a 0600 file deleted when the run ends."""
+
+    def __init__(self, cfg: dict, helper: str):
+        self.cfg = cfg
+        self.base_url, self.helper = cfg["base_url"], helper
+        self.bridge = None
+        self.token_file: Path | None = None
+
+    def open(self, log_path: Path | None = None) -> None:
+        if self.cfg["api"] != "openai" or self.bridge:
+            return
+        self.bridge = new_bridge(self.cfg, read_key(self.cfg), log_path)
+        self.base_url = self.bridge.start()
+        run_dir = STATE_HOME / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self.token_file = run_dir / f"bridge-{os.getpid()}-{secrets.token_hex(4)}.token"
+        fd = os.open(self.token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(self.bridge.token)
+        self.helper = f"cat {sh_path(self.token_file)}"
+
+    def close(self) -> None:
+        if self.bridge:
+            self.bridge.stop()
+        if self.token_file:
+            self.token_file.unlink(missing_ok=True)
+            self.token_file = None
+
+
 # ----------------------------------------------------------------------------- worker isolation
+
+def _junction(src: Path, dst: Path) -> bool:
+    """A Windows directory junction at dst (no privilege needed), made through the Win32 API:
+    `cmd /c mklink /J` would let cmd.exe act on & ^ % in the paths, which a repo can choose."""
+    try:
+        import _winapi
+        _winapi.CreateJunction(str(Path(src).resolve()), str(dst))
+        return True
+    except (ImportError, AttributeError, OSError):
+        return False
+
 
 def _mirror(src: Path, dst: Path) -> None:
     """Make dst reflect src: symlink where possible, else (Windows without Developer Mode,
@@ -426,11 +607,8 @@ def _mirror(src: Path, dst: Path) -> None:
         return
     except OSError:
         pass
-    if IS_WINDOWS and src.is_dir() and not dst.exists():
-        # Junctions need no privilege; mklink is a cmd builtin.
-        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(dst), str(src)], capture_output=True)
-        if r.returncode == 0:
-            return
+    if IS_WINDOWS and src.is_dir() and not dst.exists() and _junction(src, dst):
+        return
     # Last resort: copy, refreshed whenever the source tree is newer than the last copy.
     stamp = dst.parent / (dst.name + ".copied-at")
     src_mtime = max([src.stat().st_mtime] + [p.stat().st_mtime for p in src.rglob("*")]) \
@@ -492,7 +670,7 @@ def worker_env(cfg: dict, model: str, home: Path, base_url: str) -> dict:
 
 
 def worker_settings(cfg: dict, helper: str, role: str = "coder") -> dict:
-    deny = DEFAULT_DENY + _secret_denies() + list(cfg.get("deny") or [])
+    deny = DEFAULT_DENY + _secret_denies(cfg) + list(cfg.get("deny") or [])
     if role == "scout":
         deny = deny + SCOUT_DENY
     return {
@@ -646,19 +824,38 @@ class Task:
             return str(p)
 
 
+_EXCLUDED: set[Path] = set()
+
+
 def team_dir(repo: Path) -> Path:
     d = repo / TEAM_DIR
-    if not d.exists():
-        (d / "tasks").mkdir(parents=True)
-        exclude = Path(git(repo, "rev-parse", "--git-path", "info/exclude"))
-        if not exclude.is_absolute():
-            exclude = repo / exclude
-        exclude.parent.mkdir(parents=True, exist_ok=True)
-        lines = exclude.read_text().splitlines() if exclude.exists() else []
-        if f"/{TEAM_DIR}/" not in lines:
-            with exclude.open("a") as f:
-                f.write(f"\n# multiagents task files (local only)\n/{TEAM_DIR}/\n")
+    (d / "tasks").mkdir(parents=True, exist_ok=True)
+    ensure_excluded(repo)
     return d
+
+
+def ensure_excluded(repo: Path) -> None:
+    """Keep .multiagents/ out of git via info/exclude. Checked on every use, not only when the
+    folder is created: a first call that could not write .git (read-only inside the Codex
+    sandbox) is repaired by the next call that can."""
+    if repo in _EXCLUDED:
+        return
+    exclude = Path(git(repo, "rev-parse", "--git-path", "info/exclude"))
+    if not exclude.is_absolute():
+        exclude = repo / exclude
+    try:
+        # Bytes: the file may be in any encoding, and a decode error must not break every command.
+        lines = [ln.strip() for ln in exclude.read_bytes().splitlines()] if exclude.exists() else []
+        if f"/{TEAM_DIR}/".encode() not in lines:
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            with exclude.open("ab") as f:
+                f.write(f"\n# multiagents task files (local only)\n/{TEAM_DIR}/\n".encode())
+    except OSError as e:
+        if not in_codex_sandbox():  # expected there; the next unsandboxed call fixes it
+            print(f"note: could not add /{TEAM_DIR}/ to {exclude} ({e}); task files may show up "
+                  "in git status", file=sys.stderr)
+        return
+    _EXCLUDED.add(repo)
 
 
 def all_tasks(repo: Path) -> list[Task]:
@@ -684,9 +881,37 @@ def slugify(text: str) -> str:
 
 # ----------------------------------------------------------------------------- git per task
 
+# Regenerable caches that running tests leaves behind. They are never a worker's unsaved work,
+# so a worktree holding only these still counts as clean (accept, sync, reject).
+_JUNK_UNTRACKED = re.compile(r"(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.hypothesis)/$"
+                             r"|(^|/)\.DS_Store$|\.py[co]$")
+
+
 def dirty_files(repo: Path) -> list[str]:
-    out = git(repo, "status", "--porcelain")
-    return [line for line in out.splitlines() if line.strip()]
+    """`git status` entries as "XY path", minus untracked caches (see _JUNK_UNTRACKED)."""
+    try:
+        # UTF-8 explicitly (not the Windows locale codec); surrogateescape keeps odd bytes
+        # intact so the paths can be handed back to git. Untracked dirs stay collapsed
+        # whatever status.showUntrackedFiles says, which _JUNK_UNTRACKED relies on.
+        r = subprocess.run([exe("git"), "status", "--porcelain", "-z", "--untracked-files=normal"],
+                           cwd=repo, capture_output=True, text=True, encoding="utf-8",
+                           errors="surrogateescape")
+    except FileNotFoundError:
+        die("git not found on PATH (multiagents requires git)")
+    if r.returncode != 0:
+        die(f"git status failed: {r.stderr.strip() or r.stdout.strip()}")
+    fields, out, i = r.stdout.split("\0"), [], 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        if "R" in entry[:2] or "C" in entry[:2]:
+            i += 1  # with -z the rename/copy source follows as its own field
+        if entry.startswith("?? ") and _JUNK_UNTRACKED.search(entry[3:]):
+            continue
+        out.append(entry)
+    return out
 
 
 def current_branch(repo: Path) -> str:
@@ -698,18 +923,90 @@ def provision_worktree(cfg: dict, repo: Path, wt: Path) -> None:
     """A worktree is a clean checkout: git-ignored build state (node_modules, .env, Pods...)
     is not in it. Link the paths the project lists in "worktree_link" from the main tree so
     workers can build without re-bootstrapping. Paths are shared, not copied — parallel tasks
-    share e.g. one node_modules; list only what tolerates that."""
-    for rel in cfg.get("worktree_link") or []:
-        rel = str(rel).strip().lstrip("/")
-        if not rel or ".." in rel.split("/"):
+    share e.g. one node_modules; list only what tolerates that. Best effort: a path that
+    cannot be linked is reported and skipped, never a reason to fail the run."""
+    links = cfg.get("worktree_link") or []
+    if isinstance(links, str):
+        links = [links]
+    if not isinstance(links, list) or not all(isinstance(x, str) for x in links):
+        print("note: ignoring worktree_link: it must be a path or a list of paths", file=sys.stderr)
+        return
+    # A list from the repo's own (untrusted) config may only reach inside the repo; one from
+    # the user config may follow symlinks out of it (e.g. .env -> ~/secrets/app.env).
+    confined = "worktree_link" in (cfg.get("_from_project") or ())
+    root = repo.resolve()
+    linked: list[str] = []
+    for rel in links:
+        # No trailing slash: a "/node_modules/" exclude line would not match the link.
+        rel = str(rel).strip().replace("\\", "/").strip("/")
+        parts = rel.split("/")
+        if (not rel or ".." in parts or ".git" in (p.lower().rstrip(". ") for p in parts)
+                or re.match(r"^[A-Za-z]:", rel)):
+            print(f"note: not linking {rel!r}: worktree_link takes paths inside the repo "
+                  "(no .., no .git)", file=sys.stderr)
             continue
         src, dst = repo / rel, wt / rel
-        if src.exists() and not dst.exists() and not dst.is_symlink():
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                _mirror(src, dst)
-            except OSError as e:
-                print(f"note: could not link {rel} into the worktree ({e})", file=sys.stderr)
+        try:
+            if confined and src.exists():
+                try:
+                    src.resolve().relative_to(root)
+                except ValueError:
+                    print(f"note: not linking {rel} into the worktree: it resolves outside the repo "
+                          "(allowed only when worktree_link is set in ~/.multiagents/config.json)",
+                          file=sys.stderr)
+                    continue
+            if src.exists() and not dst.exists() and not dst.is_symlink():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if _link_path(src, dst):
+                    linked.append(rel)
+                else:
+                    print(f"note: could not link {rel} into the worktree", file=sys.stderr)
+        except OSError as e:
+            print(f"note: could not link {rel} into the worktree ({e})", file=sys.stderr)
+    if not linked:
+        return
+    # A symlink is not a directory to git, so a "node_modules/" rule in .gitignore does not
+    # cover the link: the worktree would look dirty and accept would refuse. Exclude such links
+    # by exact path. info/exclude is shared by all worktrees, so this also hides these exact
+    # paths in the main tree, where they are the real (normally already ignored) files.
+    exclude = None
+    try:
+        unignored = [rel for rel in linked
+                     if subprocess.run([exe("git"), "check-ignore", "-q", "--", rel], cwd=wt,
+                                       capture_output=True).returncode != 0]
+        if unignored:
+            exclude = Path(git(wt, "rev-parse", "--git-path", "info/exclude"))
+            exclude = exclude if exclude.is_absolute() else wt / exclude
+            have = [ln.strip() for ln in exclude.read_bytes().splitlines()] if exclude.exists() else []
+            # Anchored exact paths; glob characters escaped. (A "#" only starts a comment at the
+            # beginning of a line, so the note goes on a line of its own.)
+            lines = ["/" + re.sub(r"([*?\[\]\\])", r"\\\1", rel) for rel in unignored]
+            lines = [ln for ln in lines if ln.encode() not in have]
+            if lines:
+                exclude.parent.mkdir(parents=True, exist_ok=True)
+                with exclude.open("ab") as f:
+                    f.write(("\n# multiagents worktree_link\n" + "\n".join(lines) + "\n").encode())
+    except (OSError, Fail) as e:
+        print(f"note: could not add the links to {exclude or 'info/exclude'} ({e}); "
+              "they may show up as untracked files", file=sys.stderr)
+    print(f"linked into the worktree: {', '.join(linked)}", file=sys.stderr)
+
+
+def _link_path(src: Path, dst: Path) -> bool:
+    """Symlink dst -> src; without symlink rights (Windows), a junction for a directory or a
+    hard link for a file. Never a copy: node_modules is far too big for that."""
+    try:
+        dst.symlink_to(src, target_is_directory=src.is_dir())
+        return True
+    except OSError:
+        pass
+    if IS_WINDOWS and src.is_dir():
+        return _junction(src, dst)
+    try:
+        os.link(src, dst)
+        return True
+    except OSError:
+        return False
 
 
 def prepare_git(cfg: dict, task: Task, role: str, allow_dirty: bool) -> Path:
@@ -735,6 +1032,8 @@ def prepare_git(cfg: dict, task: Task, role: str, allow_dirty: bool) -> Path:
             wt.parent.mkdir(exist_ok=True)
             git(repo, "worktree", "add", "-b", branch, str(wt), m["base_commit"])
             m["branch"], m["worktree"] = branch, str(wt)
+            task.save()  # the branch and worktree exist now; record them before anything else
+            provision_worktree(cfg, repo, wt)
         elif cfg["use_branches"]:
             dirty = dirty_files(repo)
             if dirty and not allow_dirty:
@@ -758,6 +1057,7 @@ def prepare_git(cfg: dict, task: Task, role: str, allow_dirty: bool) -> Path:
             git(repo, "worktree", "prune")
             wt.parent.mkdir(parents=True, exist_ok=True)
             git(repo, "worktree", "add", str(wt), m["branch"])
+            provision_worktree(cfg, repo, wt)
         return wt
     current = current_branch(repo)
     if m.get("branch") and current != m["branch"]:
@@ -950,14 +1250,16 @@ def cmd_run(args) -> int:
     model = resolve_model(cfg, args.model or cfg["models"][role])
     binary = claude_bin(cfg)
     source, helper = key_source(cfg)
-    if not helper:
+    if not source:
         die(no_key_help(cfg))
+    endpoint = WorkerEndpoint(cfg, helper)
     lock = acquire_lock(task, role, exclusive_repo=runs_inline(cfg, task.meta, role))
     try:
         ensure_selftest(cfg, binary)
         workdir = prepare_git(cfg, task, role, args.allow_dirty)
-        return _run_worker(args, cfg, repo, workdir, task, role, model, binary, helper, feedback)
+        return _run_worker(args, cfg, repo, workdir, task, role, model, binary, endpoint, feedback)
     finally:
+        endpoint.close()
         lock.unlink(missing_ok=True)
 
 
@@ -982,8 +1284,10 @@ def _pid_alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
-        # Recycled by another user's process — all real workers run as the invoking user.
-        return False
+        # The pid exists. Normally it was recycled by another user's process (all real workers
+        # run as the invoking user) — but Codex's sandbox denies signals to every process
+        # outside it, our own workers included, so there "can't tell" must mean alive.
+        return in_codex_sandbox()
 
 
 def _live_lock(lock: Path) -> dict | None:
@@ -1053,7 +1357,7 @@ def acquire_lock(task: Task, role: str, exclusive_repo: bool) -> Path:
     return lock  # unreachable
 
 
-def _run_worker(args, cfg, repo, workdir, task, role, model, binary, helper, feedback) -> int:
+def _run_worker(args, cfg, repo, workdir, task, role, model, binary, endpoint, feedback) -> int:
     rounds = task.meta.setdefault("rounds", [])
     n = len(rounds) + 1
     tag = f"{n:02d}-{role}"
@@ -1070,8 +1374,10 @@ def _run_worker(args, cfg, repo, workdir, task, role, model, binary, helper, fee
 
     mode = args.permission_mode or cfg["permission_mode"]
     max_turns = args.max_turns or cfg["max_turns"].get(role)
+    bridge_log = task.dir / f"{tag}-bridge.log"
+    endpoint.open(bridge_log)  # starts the local bridge for OpenAI-API providers
     cmd = [binary, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode,
-           "--settings", json.dumps(worker_settings(cfg, helper, role)), "--strict-mcp-config",
+           "--settings", json.dumps(worker_settings(cfg, endpoint.helper, role)), "--strict-mcp-config",
            # The task dir holds the spec, feedback, screenshots and the report the worker
            # writes; in worktree mode it sits outside the worker's cwd.
            "--add-dir", str(task.dir),
@@ -1087,7 +1393,7 @@ def _run_worker(args, cfg, repo, workdir, task, role, model, binary, helper, fee
         cmd += ["--disallowedTools", "Edit", "NotebookEdit", "Write"]
     if resume_id:
         cmd += ["--resume", resume_id]
-    env = worker_env(cfg, model, worker_home(cfg), cfg["base_url"])
+    env = worker_env(cfg, model, worker_home(cfg), endpoint.base_url)
 
     head_before = git(workdir, "rev-parse", "HEAD")
     rnd = {"n": n, "role": role, "model": model, "started": now_iso(), "report": task.rel(report),
@@ -1274,6 +1580,9 @@ def _run_worker(args, cfg, repo, workdir, task, role, model, binary, helper, fee
         print(f"tool errors during run: {state['errors']} (details: {task.rel(log_path)})")
     if state.get("retries"):
         print(f"API retries: {state['retries']} ({cfg['provider_name']} was slow or flaky for {short_model(model)})")
+    if endpoint.bridge and endpoint.bridge.stats["errors"]:
+        print(f"bridge: {endpoint.bridge.stats['errors']} of {endpoint.bridge.stats['requests']} request(s) "
+              f"failed (details: {task.rel(bridge_log)})")
     print(f"report: {task.rel(report)}   log: {task.rel(log_path)}")
     label = "report" if role == "scout" or outcome != "success" else f"report digest (full: {task.rel(report)})"
     print(f"----- {label} -----")
@@ -1368,7 +1677,7 @@ def cmd_diff(args) -> int:
     if m.get("worktree") and wt.exists() and dirty_files(wt):
         print(f"note: the task worktree has uncommitted changes that this diff does not show "
               f"({wt})", file=sys.stderr)
-    r = subprocess.run(["git", "diff", *(["--stat"] if stat else []), *span, "--", *paths], cwd=repo)
+    r = subprocess.run([exe("git"), "diff", *(["--stat"] if stat else []), *span, "--", *paths], cwd=repo)
     return r.returncode
 
 
@@ -1404,7 +1713,7 @@ def cmd_digest(args) -> int:
 def _merge_task(repo: Path, task: Task, squash: bool) -> None:
     m = task.meta
     if squash:
-        r = subprocess.run(["git", "merge", "--squash", m["branch"]],
+        r = subprocess.run([exe("git"), "merge", "--squash", m["branch"]],
                            cwd=repo, capture_output=True, text=True)
         if r.returncode != 0:
             conflicted = git(repo, "diff", "--name-only", "--diff-filter=U", check=False)
@@ -1412,7 +1721,7 @@ def _merge_task(repo: Path, task: Task, squash: bool) -> None:
             _merge_conflict_die(task, conflicted)
         git(repo, "commit", "-m", f"{task.id}: {m.get('title', '')}")
     else:
-        r = subprocess.run(["git", "merge", "--no-ff", m["branch"], "-m",
+        r = subprocess.run([exe("git"), "merge", "--no-ff", m["branch"], "-m",
                             f"Merge {task.id}: {m.get('title', '')}"],
                            cwd=repo, capture_output=True, text=True)
         if r.returncode != 0:
@@ -1485,8 +1794,14 @@ def cmd_reject(args) -> int:
             dirty = dirty_files(wt)
             if dirty:
                 # Never destroy work: park it on the task branch so "kept for reference" is true.
-                git(wt, "add", "-A")
-                r = subprocess.run(["git", "commit", "-m", f"[{task.id}] WIP at reject"],
+                paths = "\0".join(d[3:] for d in dirty).encode("utf-8", "surrogateescape")
+                r = subprocess.run([exe("git"), "--literal-pathspecs", "add", "-A",
+                                    "--pathspec-from-file=-", "--pathspec-file-nul"],
+                                   cwd=wt, input=paths, capture_output=True)
+                if r.returncode != 0:
+                    die(f"could not stage the worktree's uncommitted files: "
+                        f"{r.stderr.decode('utf-8', 'replace').strip()[:200]}; resolve in {wt} first")
+                r = subprocess.run([exe("git"), "commit", "-m", f"[{task.id}] WIP at reject"],
                                    cwd=wt, capture_output=True, text=True)
                 if r.returncode != 0:
                     die(f"the worktree has {len(dirty)} uncommitted file(s) and they could not be "
@@ -1522,7 +1837,7 @@ def cmd_sync(args) -> int:
         die(f"worktree missing at {wt}; run a worker round first (it re-creates it)")
     if dirty_files(wt):
         die("the task worktree has uncommitted changes; commit them first")
-    r = subprocess.run(["git", "merge", "--no-edit", m["base_branch"]], cwd=wt,
+    r = subprocess.run([exe("git"), "merge", "--no-edit", m["base_branch"]], cwd=wt,
                        capture_output=True, text=True)
     if r.returncode == 0:
         print(f"{task.id}: merged {m['base_branch']} into {m['branch']} cleanly")
@@ -1558,7 +1873,7 @@ def http_json(url: str, key: str, payload: dict | None = None, timeout: int = 60
         if data:
             conf += "data = " + json.dumps(data.decode()) + "\n"
         try:
-            r = subprocess.run(["curl", "-sS", "-m", str(timeout), "-w", "\n%{http_code}", "-K", "-", url],
+            r = subprocess.run([exe("curl"), "-sS", "-m", str(timeout), "-w", "\n%{http_code}", "-K", "-", url],
                                input=conf, capture_output=True, text=True)
         except FileNotFoundError:
             die("python has no CA certificates and curl is not installed; "
@@ -1582,35 +1897,61 @@ def cmd_doctor(args) -> int:
     binary = claude_bin(cfg)
     line("claude", "OK", f"{binary} ({claude_version(binary)})")
     line("provider", "OK", f"{cfg['provider_name']} — {cfg.get('label', cfg['base_url'])}")
-    source, helper = key_source(cfg)
-    if not helper:
+    source, _helper = key_source(cfg)
+    if not source:
         line("api key", "FAIL", "not found")
         print("\n" + no_key_help(cfg))
         return 1
-    line("api key", "OK", source)
-    key = read_key(helper)
     try:
-        code, body = http_json(cfg["models_url"], key)
-        ids = [m.get("id", "") for m in body.get("data", [])] if code == 200 else []
-        line("endpoint", "OK" if code == 200 else "FAIL", f"HTTP {code}, {len(ids)} models visible")
-        ok &= code == 200
+        key = read_key(cfg)
+    except Fail as e:
+        line("api key", "FAIL", str(e))
+        return 1
+    line("api key", "OK", source)
+
+    def redact(text: str) -> str:  # a provider may quote the key it was sent
+        return str(text).replace(key, "[redacted]")
+
+    bridge = None
+    try:
+        ids = None  # None: the provider has no model list
+        if cfg.get("models_url"):
+            code, body = http_json(cfg["models_url"], key)
+            ids = [m.get("id", "") for m in body.get("data", [])] if code == 200 else []
+            line("endpoint", "OK" if code == 200 else "FAIL", f"HTTP {code}, {len(ids)} models visible")
+            ok &= code == 200
+        else:
+            line("endpoint", "--", "no model list on this provider; each model gets a test request")
+        # Probe the way workers talk: Anthropic Messages, through the local bridge if needed.
+        probe_url, probe_key = cfg["base_url"], key
+        if cfg["api"] == "openai":
+            bridge = new_bridge(cfg, key)
+            probe_url, probe_key = bridge.start(), bridge.token
         wanted = sorted({resolve_model(cfg, cfg["models"][r]) for r in ROLES})
         for model in wanted:
             roles = [r for r in ROLES if resolve_model(cfg, cfg["models"][r]) == model]
-            if args.quick:
+            if args.quick and ids is not None:
                 seen = model in ids
                 line("model", "OK" if seen else "WARN", f"{short_model(model)} ({', '.join(roles)}) {'listed' if seen else 'not in the models list'}")
                 continue
             t0 = time.time()
-            code, body = http_json(cfg["base_url"] + "/v1/messages", key,
-                                   {"model": model, "max_tokens": 64, "messages": [{"role": "user", "content": "Reply OK"}]})
+            probe = {"model": model, "max_tokens": 64, "messages": [{"role": "user", "content": "Reply OK"}]}
+            if bridge:  # the shape workers send: Claude Code's default output cap, and tools
+                probe.update(max_tokens=32000, tools=[{"name": "noop", "description": "Does nothing.",
+                                                       "input_schema": {"type": "object", "properties": {}}}])
+            code, body = http_json(probe_url + "/v1/messages", probe_key, probe)
             good = code == 200
             ok &= good
-            detail = f"{time.time() - t0:.1f}s" if good else (body.get("error", {}) or {}).get("message", f"HTTP {code}")
-            line("model", "OK" if good else "FAIL", f"{short_model(model)} ({', '.join(roles)}) {detail}")
+            err = body.get("error") if isinstance(body, dict) else None
+            detail = (f"{time.time() - t0:.1f}s" + (" via the local bridge" if bridge else "") if good
+                      else (err.get("message") if isinstance(err, dict) else None) or f"HTTP {code}")
+            line("model", "OK" if good else "FAIL", f"{short_model(model)} ({', '.join(roles)}) {redact(detail)}")
     except Exception as e:  # network problems should not hide the other checks
         ok = False
-        line("endpoint", "FAIL", str(e)[:200])
+        line("endpoint", "FAIL", redact(e)[:200])
+    finally:
+        if bridge:
+            bridge.stop()
     del key
     passed, detail = run_selftest(cfg, binary, force=args.force)
     ok &= passed
@@ -1648,13 +1989,13 @@ def cmd_shot(args) -> int:
     name = re.sub(r"[^A-Za-z0-9._-]+", "-", args.name)
     path = shots / (name if name.endswith(".png") else name + ".png")
     if args.ios:
-        if not shutil.which("xcrun"):
+        if not find_exe("xcrun"):
             die("--ios needs macOS with the Xcode command-line tools (xcrun not found)")
         r = subprocess.run(["xcrun", "simctl", "io", args.device, "screenshot", str(path)], capture_output=True, text=True)
         if r.returncode != 0:
             die("simulator screenshot failed: " + (r.stderr.strip() or r.stdout.strip()))
     elif args.url:
-        chrome = next((c for c in CHROME_CANDIDATES if (os.path.isfile(c) or shutil.which(c))), None)
+        chrome = next((c for c in CHROME_CANDIDATES if (os.path.isfile(c) or find_exe(c))), None)
         if not chrome:
             die("no Chrome/Chromium/Edge found for headless screenshots")
         url = args.url if "://" in args.url else "http://" + args.url
@@ -1669,7 +2010,7 @@ def cmd_shot(args) -> int:
                                f'<iframe src="{html.escape(url, quote=True)}" width="{width}" height="{height}" '
                                'style="border:0;display:block"></iframe></body>')
             target = wrapper.as_uri()
-        cmd = [shutil.which(chrome) or chrome, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+        cmd = [find_exe(chrome) or chrome, "--headless=new", "--disable-gpu", "--hide-scrollbars",
                "--no-first-run", "--no-default-browser-check", f"--window-size={max(width, 500)},{height}",
                f"--screenshot={path}", f"--user-data-dir={STATE_HOME / 'chrome-profile'}"]
         if args.dark:
@@ -1692,10 +2033,10 @@ def cmd_shot(args) -> int:
         if not path.exists() or path.stat().st_size == 0:
             die("headless screenshot failed (is the page reachable?)")
         if narrow:
-            if shutil.which("sips"):
+            if find_exe("sips"):
                 subprocess.run(["sips", "-c", str(height), str(width), str(path)], capture_output=True)
-            elif shutil.which("magick") or shutil.which("convert"):
-                tool = shutil.which("magick") or shutil.which("convert")
+            elif find_exe("magick") or find_exe("convert"):
+                tool = find_exe("magick") or find_exe("convert")
                 subprocess.run([tool, str(path), "-gravity", "center", "-crop", f"{width}x{height}+0+0",
                                 "+repage", str(path)], capture_output=True)
             else:
@@ -1709,10 +2050,13 @@ def cmd_shot(args) -> int:
 
 def cmd_models(args) -> int:
     cfg = load_config_here()
-    _, helper = key_source(cfg)
-    if not helper:
-        die(no_key_help(cfg))
-    code, body = http_json(cfg["models_url"], read_key(helper))
+    if not cfg.get("models_url"):
+        print(f"{cfg['provider_name']} has no model-list endpoint; the configured models are:", file=sys.stderr)
+        known = {resolve_model(cfg, m) for m in cfg["models"].values() if m} | set(cfg.get("aliases", {}).values())
+        for i in sorted(known):
+            print(i)
+        return 0
+    code, body = http_json(cfg["models_url"], read_key(cfg))
     if code != 200:
         die(f"{cfg['provider_name']} returned HTTP {code}")
     ids = sorted(m.get("id", "") for m in body.get("data", []))
@@ -1729,52 +2073,151 @@ def cmd_selftest(args) -> int:
     return 0 if passed else 1
 
 
-def cmd_install_codex(args) -> int:
-    """Install the lead skill into OpenAI Codex (~/.agents/skills) and put the CLI on PATH."""
-    src = ROOT / "codex" / "skills" / "multiagents-lead"
-    if not (src / "SKILL.md").is_file():
-        die(f"bundled Codex skill not found at {src}")
-    dest_root = Path(args.dir).expanduser() if args.dir else Path.home() / ".agents" / "skills"
-    dest = dest_root / "multiagents-lead"
-    dest_root.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        shutil.rmtree(dest)
-    shutil.copytree(src, dest)
-    print(f"installed Codex skill: {dest}")
+CODEX_MARKETPLACE = "multiagents"  # "name" in .agents/plugins/marketplace.json
+CODEX_PLUGIN = "multiagents"       # "name" in .codex-plugin/plugin.json
 
-    # Always create the link: inside a Claude Code session the plugin's own bin/ is on PATH,
-    # which proves nothing about the login-shell PATH that Codex will use.
-    bin_dir = Path.home() / ".local" / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    existing = shutil.which("multiagents")
-    if IS_WINDOWS:
-        # No symlink rights needed: write .cmd (PowerShell/cmd) and sh (Git Bash) shims.
-        script = ROOT / "worker" / "multiagents.py"
-        link = bin_dir / "multiagents.cmd"
-        link.write_text("@echo off\r\nsetlocal\r\n"
-                        f"set \"MA={script}\"\r\n"
-                        "where py >nul 2>nul && ( py -3 \"%MA%\" %* ) || ( python \"%MA%\" %* )\r\n")
-        sh_shim = bin_dir / "multiagents"
-        sh_shim.write_text("#!/bin/sh\n"
-                           f"exec \"{str(ROOT / 'bin' / 'multiagents').replace(chr(92), '/')}\" \"$@\"\n")
-        print(f"wrote {link} and {sh_shim}")
+
+def find_codex(explicit: str | None) -> str:
+    """The Codex CLI: --codex, then PATH, then the copy bundled in the desktop app (macOS)."""
+    if explicit:
+        found = find_exe(str(Path(explicit).expanduser()))
+        if not found:
+            die(f"Codex CLI not found at {explicit}")
+        return found
+    found = find_exe("codex")
+    if found:
+        return found
+    for base in (Path("/Applications"), Path.home() / "Applications"):
+        for app in ("ChatGPT.app", "Codex.app"):
+            p = base / app / "Contents" / "Resources" / "codex"
+            if p.is_file() and os.access(p, os.X_OK):
+                return str(p)
+    die("Codex CLI not found. Install Codex (the ChatGPT desktop app, or npm i -g @openai/codex), "
+        "or pass --codex /path/to/codex")
+
+
+def run_codex(codex: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    # From the home folder: Codex also reads a trusted project's .codex/config.toml, and the repo
+    # we happen to be in must not be able to redefine the "multiagents" marketplace.
+    r = subprocess.run([codex, *args], cwd=Path.home(), capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"codex {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}")
+    return r
+
+
+def in_plugin_cache(p: Path) -> bool:
+    """True inside a Claude Code or Codex plugin cache (.../plugins/cache/...), whose path
+    changes with every plugin update — never register one as a marketplace."""
+    parts = p.parts
+    return any(a == "plugins" and b == "cache" for a, b in zip(parts, parts[1:]))
+
+
+def codex_git_source() -> str:
+    """owner/repo from .codex-plugin/plugin.json's "repository", so forks install from themselves."""
+    url = (read_json(ROOT / ".codex-plugin" / "plugin.json", {}) or {}).get("repository", "")
+    m = re.match(r"https://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$", url)
+    if not m:
+        die("no GitHub repository in .codex-plugin/plugin.json; pass --source")
+    return m.group(1)
+
+
+def is_local_source(s: str) -> bool:
+    """A marketplace source is a local folder only when written as one: absolute, or starting
+    with . or ~. "owner/repo" is a GitHub repo even if such a folder happens to exist here."""
+    s = (s or "").strip()
+    return (s.startswith(("/", ".", "~", "\\\\")) or bool(re.match(r"^[A-Za-z]:[\\/]", s)))
+
+
+def same_source(a: str, b: str) -> bool:
+    def norm(s: str) -> str:
+        s = (s or "").strip()
+        if is_local_source(s):
+            return str(Path(s).expanduser().resolve())
+        s = re.sub(r"^(https://github\.com/|git@github\.com:)", "", s)
+        return re.sub(r"(\.git)?/?$", "", s).lower()
+    return norm(a) == norm(b)
+
+
+def cmd_install_codex(args) -> int:
+    """Install or update the plugin in OpenAI Codex through Codex's own plugin CLI."""
+    codex = find_codex(args.codex)
+    try:
+        listing = json.loads(run_codex(codex, "plugin", "marketplace", "list", "--json").stdout or "{}")
+    except json.JSONDecodeError:
+        die("could not parse `codex plugin marketplace list --json` — is this Codex build too old for plugins?")
+    current = next((m for m in listing.get("marketplaces", []) if m.get("name") == CODEX_MARKETPLACE), None)
+    cur = (current or {}).get("marketplaceSource") or {}
+
+    if args.source:
+        source = args.source.strip()
+        if is_local_source(source):
+            source = str(Path(source).expanduser().resolve())
+    elif current:
+        source = cur.get("source", "")  # updating: keep whatever the user registered
+    elif (ROOT / ".git").exists() and not in_plugin_cache(ROOT):
+        source = str(ROOT)  # a clone: Codex reads it as a local marketplace
     else:
-        link = bin_dir / "multiagents"
-        target = ROOT / "bin" / "multiagents"
-        if link.is_symlink() or link.exists():
-            link.unlink()
-        link.symlink_to(target)
-        print(f"linked {link} -> {target}")
-    if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
-        print(f"note: add {bin_dir} to PATH (e.g. in ~/.zshrc) so Codex shell commands can find `multiagents`")
-    if existing and Path(existing).resolve() not in (link.resolve(), target.resolve()):
-        print(f"note: another `multiagents` is already on PATH at {existing}; it will win over the new link")
-    if "plugins/cache" in str(ROOT):
-        print("note: this install came from the Claude Code plugin cache, whose path changes on "
-              "plugin updates — re-run `multiagents install-codex` after updating the plugin")
-    print("done. In Codex, start a NEW session and invoke it as: $multiagents-lead <task>")
+        source = codex_git_source()
+    if is_local_source(source):
+        if not Path(source).is_dir():
+            die(f"the marketplace source {source} does not exist (anymore); re-run with --source "
+                f"<clone folder or {codex_git_source()}>")
+        if not (Path(source) / ".agents" / "plugins" / "marketplace.json").is_file():
+            die(f"{source} has no .agents/plugins/marketplace.json — not a multiagents checkout")
+
+    if current and same_source(cur.get("source", ""), source):
+        if cur.get("sourceType") != "local":
+            run_codex(codex, "plugin", "marketplace", "upgrade", CODEX_MARKETPLACE)
+        # a local marketplace is read in place; `plugin add` below re-copies it
+    else:
+        previous = cur.get("source") if current else None
+        if previous:
+            print(f"replacing Codex marketplace '{CODEX_MARKETPLACE}' (was {previous})", flush=True)
+            run_codex(codex, "plugin", "marketplace", "remove", CODEX_MARKETPLACE)
+        r = run_codex(codex, "plugin", "marketplace", "add", source, check=False)
+        if r.returncode != 0:
+            msg = f"codex plugin marketplace add {source} failed: {(r.stderr or r.stdout).strip()}"
+            if previous:  # don't leave the user without the marketplace they had
+                back = run_codex(codex, "plugin", "marketplace", "add", previous, check=False)
+                msg += ("\nkept the previous marketplace source " + previous if back.returncode == 0 else
+                        f"\nrestoring the previous source {previous} failed too: "
+                        f"{(back.stderr or back.stdout).strip()}")
+            die(msg)
+    print(run_codex(codex, "plugin", "add", f"{CODEX_PLUGIN}@{CODEX_MARKETPLACE}").stdout.strip())
+    print(f"marketplace source: {source}")
+    _remove_legacy_codex_install()
+    print("done. Start a NEW Codex thread and type: $multiagents:lead <what to build or fix>")
     print("Workers still run on the Claude Code engine — the `claude` CLI must be installed.")
     return 0
+
+
+def _remove_legacy_codex_install() -> None:
+    """Up to v0.3.0, install-codex copied a standalone skill and linked the CLI onto PATH."""
+    legacy = Path.home() / ".agents" / "skills" / "multiagents-lead"
+    legacy_md = legacy / "SKILL.md"
+    if legacy_md.is_file() and re.search(r"(?m)^name:\s*multiagents-lead\s*$",
+                                         legacy_md.read_text(errors="replace")):
+        if legacy.is_symlink():
+            legacy.unlink()
+        else:
+            shutil.rmtree(legacy)
+        print(f"removed the old standalone skill {legacy} (the plugin provides it now)")
+    # The PATH shims: the plugin's skills call its own bin/multiagents, so they are only kept
+    # while they still work (you may use them in your shell); dead ones are removed.
+    bin_dir = Path.home() / ".local" / "bin"
+    link = bin_dir / "multiagents"
+    if link.is_symlink() and link.resolve().name == "multiagents" and not link.exists():
+        link.unlink()
+        print(f"removed the dangling link {link}")
+    shim = bin_dir / "multiagents.cmd"
+    if IS_WINDOWS and shim.is_file():
+        m = re.search(r'set "MA=([^"]+)"', shim.read_text(errors="replace"))
+        if m and m.group(1).endswith("multiagents.py") and not Path(m.group(1)).exists():
+            shim.unlink()
+            sh = bin_dir / "multiagents"
+            if sh.is_file() and "multiagents" in sh.read_text(errors="replace"):
+                sh.unlink()
+            print(f"removed the stale shims {shim} and {sh}")
 
 
 def cmd_provider(args) -> int:
@@ -1799,7 +2242,7 @@ def cmd_provider(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="multiagents",
-                                description="Run cheap DeepSeek workers (Fireworks or api.deepseek.com) for a lead agent.")
+                                description="Run cheap DeepSeek workers (Fireworks, Hive or api.deepseek.com) for a lead agent.")
     p.add_argument("--version", action="version", version=f"multiagents {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -1816,12 +2259,15 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--all", action="store_true")
     s.set_defaults(fn=cmd_models)
 
-    s = sub.add_parser("provider", help="show or set the active provider (fireworks, deepseek, ...)")
+    s = sub.add_parser("provider", help="show or set the active provider (fireworks, deepseek, hive, ...)")
     s.add_argument("name", nargs="?")
     s.set_defaults(fn=cmd_provider)
 
-    s = sub.add_parser("install-codex", help="install the lead skill into OpenAI Codex (~/.agents/skills)")
-    s.add_argument("--dir", help="skills directory to install into (default ~/.agents/skills)")
+    s = sub.add_parser("install-codex", help="install or update the plugin in OpenAI Codex")
+    s.add_argument("--source", help="marketplace source: a local clone (a path starting with / . or ~), "
+                                    "owner/repo[@ref] or a git URL (default: the registered source when "
+                                    "updating; else this clone, else the GitHub repo)")
+    s.add_argument("--codex", help="the codex CLI (default: PATH, then the ChatGPT/Codex app bundle)")
     s.set_defaults(fn=cmd_install_codex)
 
     s = sub.add_parser("new", help="create a task folder with a spec template")
@@ -1890,10 +2336,26 @@ def main(argv: list[str] | None = None) -> int:
     if os.environ.get("MULTIAGENTS_WORKER") and args.cmd in ("run", "accept", "reject", "new", "feedback", "shot", "sync"):
         print(f"multiagents: workers may not run '{args.cmd}' (team commands belong to the lead)", file=sys.stderr)
         return 2
+    # Codex runs commands in a sandbox (see in_codex_sandbox): no network, no Keychain, nothing
+    # writable outside the workspace, and .git read-only. These commands would fail there in
+    # confusing ways ("no API key found"), so say what the lead has to do instead.
+    escalate = ('Re-run the same command with sandbox_permissions="require_escalated".')
+    if (in_codex_sandbox() and not os.environ.get("MULTIAGENTS_ALLOW_SANDBOX")
+            and (args.cmd in SANDBOX_HOSTILE or (args.cmd == "provider" and args.name))):
+        print(f"multiagents: '{args.cmd}' has to run outside the Codex sandbox (it needs network "
+              f"access, the Keychain, ~/.multiagents and write access to .git). {escalate}",
+              file=sys.stderr)
+        return 2
     try:
         return args.fn(args)
     except Fail as e:
         print(f"multiagents: {e}", file=sys.stderr)
+        return 2
+    except PermissionError as e:
+        if not in_codex_sandbox():
+            raise
+        # e.g. `new` in Codex's read-only mode, which the workspace-write mode would allow.
+        print(f"multiagents: the Codex sandbox blocked a write ({e}). {escalate}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         return 130
