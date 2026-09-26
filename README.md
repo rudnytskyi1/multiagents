@@ -1,16 +1,20 @@
 # multiagents
 
-**Your expensive session leads. Cheap DeepSeek workers do the typing.**
+**Stop burning your Claude Max (or ChatGPT) limits on typing.** Your Opus or Codex session
+stays the lead: it plans, writes the specs and reviews the code and the running UI. Cheap
+DeepSeek V4.1 Flash workers write the code, run the build, the tests and your review agents, and
+fix what the lead sends back. A typical small task costs **under one cent**.
+
+A plugin for **Claude Code** and **OpenAI Codex**. Workers run on Fireworks, Hive or
+api.deepseek.com, and your subscription credentials never reach those endpoints.
 
 Docs: [getting started](docs/getting-started.md) · [how it works](docs/how-it-works.md) ·
 [configuration](docs/configuration.md) · [CLI](docs/cli.md) · [providers](docs/providers.md) ·
 [security](docs/security.md) · [Codex](docs/codex.md) ·
 [troubleshooting](docs/troubleshooting.md) · [по-русски](README.ru.md)
 
-A plugin for Claude Code (with an OpenAI Codex install too) that turns your interactive session
-into a **team lead**. The lead plans the work, writes precise task specs, reviews the code and
-the running UI, and sends feedback. **Workers** are headless Claude Code processes running
-DeepSeek models on the provider you choose per project:
+The interactive session becomes a **team lead**. **Workers** are headless Claude Code processes
+running DeepSeek models on the provider you choose per project:
 
 | Provider | Endpoint | Where it runs | Typical use |
 |---|---|---|---|
@@ -36,6 +40,28 @@ you ──► lead (your Claude Code / Codex session)
           ▼                          ▼
         next task                  fixer (resumes the coder's session) ──► review again
 ```
+
+## Why not just point Claude Code at DeepSeek?
+
+You can: [claude-code-router](https://github.com/musistudio/claude-code-router),
+[deepclaude](https://github.com/aattaran/deepclaude) or a plain `ANTHROPIC_BASE_URL` swap the
+model behind your whole session. Then the cheap model does the planning and the judging too,
+and you lose the part that needs a strong model. multiagents splits the work instead:
+
+| | Swap the model (router / base URL) | Built-in subagents | **multiagents** |
+|---|---|---|---|
+| Who plans and reviews | the cheap model | your subscription model | **your subscription model** |
+| Who writes the code | the cheap model | your subscription model (uses your limits) | **cheap DeepSeek workers** |
+| Review loop with feedback and UI screenshots | no | manual | **built in** (coder → reviewer → lead → fixer) |
+| Parallel tasks | no | yes, in one tree | **yes, each in its own git worktree and branch** |
+| Subscription credentials kept away from the third party | up to you | n/a | **enforced, and verified by a leak self-test whenever the setup changes** |
+| Works from Codex too | no | no | **yes** |
+
+Measured on a real task (DeepSeek V4.1 Flash, one coder round; most of the input came from the provider's cache):
+
+| Task | Provider | Time | Cost |
+|---|---|---|---|
+| `slugify()` with pytest tests | Hive | 29 s | $0.006 |
 
 ## Requirements
 
